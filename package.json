@@ -1,0 +1,33 @@
+{
+    "name": "bot-contador",
+    "version": "0.1.0",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "dev": "tsx src/index.ts",
+        "start": "node dist/src/index.js",
+        "build": "tsc -p tsconfig.json",
+        "test": "vitest run",
+        "typecheck": "tsc -p tsconfig.json --noEmit"
+    },
+    "dependencies": {
+        "@google/genai": "^1.50.1",
+        "@inquirer/prompts": "^8.4.2",
+        "baileys": "^7.0.0-rc.9",
+        "better-sqlite3": "^12.9.0",
+        "dotenv": "^17.4.2",
+        "exceljs": "^4.4.0",
+        "node-cron": "^4.2.1",
+        "pino": "^10.3.1",
+        "qrcode-terminal": "^0.12.0",
+        "tsx": "^4.21.0",
+        "typescript": "^6.0.3",
+        "zod": "^4.3.6"
+    },
+    "devDependencies": {
+        "@types/better-sqlite3": "^7.6.13",
+        "@types/node": "^25.6.0",
+        "@types/node-cron": "^3.0.11",
+        "vitest": "^4.1.5"
+    }
+}
