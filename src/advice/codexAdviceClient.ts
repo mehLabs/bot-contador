@@ -27,7 +27,7 @@ export class CodexAdviceClient {
 
   async advise(question: string, context: FinancialAdviceContext): Promise<string> {
     const prompt = this.buildPrompt(question, context);
-    const args = ['exec', '--skip-git-repo-check', '--ephemeral', '-s', 'read-only', '-C', this.options.repoRoot];
+    const args = ['exec', '--skip-git-repo-check', '--ephemeral', '--full-auto', '-s', 'workspace-write', '-C', this.options.repoRoot];
     if (this.options.model) args.push('-m', this.options.model);
     args.push('-');
 
@@ -59,7 +59,11 @@ export class CodexAdviceClient {
       '- No inventes datos. Si falta información, decilo.',
       '- No des asesoramiento profesional de inversión, legal ni fiscal.',
       '- Separá hechos calculados de sugerencias.',
-      '- No pidas SQL ni intentes modificar archivos o base de datos.',
+      '- Actuá en modo agente: pensá el plan antes de responder, ejecutá comandos cuando hagan falta y esperá sus resultados antes de concluir.',
+      '- Usá las herramientas de terminal disponibles en el workspace para inspeccionar datos, generar reportes o verificar cálculos si la solicitud lo requiere.',
+      '- Actuá en nombre de la persona que hizo la solicitud, respetando el alcance del presupuesto compartido.',
+      '- No hagas cambios destructivos ni irreversibles salvo que la solicitud lo pida de forma explícita.',
+      '- No pidas SQL al usuario; si necesitás revisar datos, usá las herramientas locales disponibles y explicá qué hiciste.',
       '',
       `Pregunta del usuario:\n${question}`,
       '',

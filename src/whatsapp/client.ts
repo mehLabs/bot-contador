@@ -139,6 +139,21 @@ export class WhatsAppClient {
     await this.sendQueue;
   }
 
+  async whileComposing<T>(task: () => Promise<T>): Promise<T> {
+    const jid = this.selectedGroupJid;
+    if (!jid || !this.sock) return task();
+    await this.sock.sendPresenceUpdate('composing', jid).catch(() => undefined);
+    const pulse = setInterval(() => {
+      void this.sock?.sendPresenceUpdate('composing', jid).catch(() => undefined);
+    }, 8000);
+    try {
+      return await task();
+    } finally {
+      clearInterval(pulse);
+      await this.sock?.sendPresenceUpdate('paused', jid).catch(() => undefined);
+    }
+  }
+
   async sendDocument(filePath: string, caption?: string): Promise<void> {
     const jid = this.selectedGroupJid;
     if (!jid || !this.sock) return;
@@ -150,11 +165,25 @@ export class WhatsAppClient {
     });
   }
 
+  async markRead(message: IncomingMessage): Promise<void> {
+    if (!this.sock) return;
+    await this.sock.readMessages([
+      {
+        remoteJid: message.groupJid,
+        id: message.id,
+        participant: message.senderJid
+      }
+    ]);
+  }
+
   private async handleRawMessage(raw: WAMessage): Promise<void> {
     if (!this.handler || !this.selectedGroupJid || !this.listening) return;
     const groupJid = raw.key.remoteJid;
-    if (!groupJid || groupJid !== this.selectedGroupJid || raw.key.fromMe) return;
+    const selfJid = this.sock?.user?.id?.split(':')[0];
     const senderJid = raw.key.participant ?? raw.participant ?? groupJid;
+    if (!senderJid) return;
+    const senderPhone = senderJid.split('@')[0]?.split(':')[0];
+    if (!groupJid || groupJid !== this.selectedGroupJid || raw.key.fromMe || (selfJid && senderPhone && selfJid === senderPhone)) return;
     const text = extractText(raw);
     const imageMessage = raw.message?.imageMessage;
     const image = imageMessage ? await this.downloadImage(raw, imageMessage.mimetype ?? 'image/jpeg') : undefined;

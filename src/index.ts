@@ -8,6 +8,7 @@ import { WhatsAppClient } from './whatsapp/client.js';
 import { TerminalController } from './console/terminal.js';
 import { startDailyReminder } from './scheduler/reminder.js';
 import { CodexAdviceClient } from './advice/codexAdviceClient.js';
+import { agentParsedMessage, shouldRouteToAgent } from './bot/agentRouting.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -32,17 +33,23 @@ async function main(): Promise<void> {
   whatsapp.setMessageHandler(async (message) => {
     repo.upsertContact(message.senderJid, message.senderName);
     try {
-      const parsed = await parser.parse({
-        text: message.text,
-        senderName: message.senderName,
-        senderJid: message.senderJid,
-        image: message.image ? { buffer: message.image.buffer, mimeType: message.image.mimeType } : undefined
-      });
+      const parsed = shouldRouteToAgent(message.text)
+        ? agentParsedMessage()
+        : await parser.parse({
+            text: message.text,
+            senderName: message.senderName,
+            senderJid: message.senderJid,
+            image: message.image ? { buffer: message.image.buffer, mimeType: message.image.mimeType } : undefined
+          });
       repo.saveLlmCall({ messageId: message.id, intent: parsed.intent, confidence: parsed.confidence, rawJson: JSON.stringify(parsed) });
-      const reply = await engine.handle(message, parsed);
+      const usesCodexAgent = parsed.intent === 'financial_advice' || parsed.intent === 'bot_question';
+      const reply = usesCodexAgent
+        ? await whatsapp.whileComposing(() => engine.handle(message, parsed))
+        : await engine.handle(message, parsed);
       if (!reply) return;
       await whatsapp.sendText(reply.text);
       if (reply.attachmentPath) await whatsapp.sendDocument(reply.attachmentPath, 'Reporte de disponibilidad');
+      if (reply.actionTaken) await whatsapp.markRead(message);
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
       repo.saveLlmCall({ messageId: message.id, error: messageText });

@@ -43,6 +43,17 @@ CREATE TABLE IF NOT EXISTS budget_categories (
   UNIQUE(period_id, name, person_id)
 );
 
+CREATE TABLE IF NOT EXISTS fixed_expenses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  period_id INTEGER NOT NULL REFERENCES budget_periods(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('manual', 'credit_card')) DEFAULT 'manual',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(period_id, name, source)
+);
+
 CREATE TABLE IF NOT EXISTS expenses (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   public_id TEXT NOT NULL UNIQUE,
@@ -57,6 +68,7 @@ CREATE TABLE IF NOT EXISTS expenses (
   source_message_id TEXT NOT NULL,
   source_group_jid TEXT NOT NULL,
   receipt_path TEXT,
+  expense_type TEXT NOT NULL CHECK (expense_type IN ('regular', 'adjustment', 'credit_card')) DEFAULT 'regular',
   status TEXT NOT NULL CHECK (status IN ('active', 'cancelled')) DEFAULT 'active',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -75,6 +87,42 @@ CREATE TABLE IF NOT EXISTS conversation_state (
   group_jid TEXT NOT NULL,
   sender_jid TEXT,
   state_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  expires_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS incomes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  period_id INTEGER NOT NULL REFERENCES budget_periods(id),
+  category_id INTEGER REFERENCES budget_categories(id),
+  amount_cents INTEGER NOT NULL,
+  currency TEXT NOT NULL,
+  description TEXT NOT NULL,
+  income_date TEXT NOT NULL,
+  sender_jid TEXT NOT NULL,
+  source_message_id TEXT NOT NULL,
+  source_group_jid TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS goals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  horizon TEXT NOT NULL CHECK (horizon IN ('short', 'medium', 'long')),
+  status TEXT NOT NULL CHECK (status IN ('active', 'done', 'cancelled')) DEFAULT 'active',
+  target_amount_cents INTEGER,
+  target_date TEXT,
+  notes TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS pending_confirmations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_jid TEXT NOT NULL,
+  sender_jid TEXT,
+  confirmation_type TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   expires_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

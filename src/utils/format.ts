@@ -10,6 +10,10 @@ export function currentPeriod(date = new Date()): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
 }
 
+export function nextPeriod(date = new Date()): string {
+  return currentPeriod(new Date(date.getFullYear(), date.getMonth() + 1, 1));
+}
+
 export function normalizePhoneFromJid(jid: string): string {
   return jid.split('@')[0]?.split(':')[0] ?? jid;
 }

@@ -1,8 +1,8 @@
 import ExcelJS from 'exceljs';
 import fs from 'node:fs';
 import path from 'node:path';
-import { BudgetSummaryCategory } from '../db/repository.js';
-import { formatMoney, sanitizeFilePart } from '../utils/format.js';
+import { AdviceExpense, BudgetSummaryCategory, FixedExpenseSummary, IncomeSummary } from '../db/repository.js';
+import { sanitizeFilePart } from '../utils/format.js';
 
 export async function createAvailabilityReport(input: {
   reportsDir: string;
@@ -10,8 +10,13 @@ export async function createAvailabilityReport(input: {
   currency: string;
   total: number;
   spent: number;
+  fixedSpent?: number;
+  variableSpent?: number;
   remaining: number;
   categories: BudgetSummaryCategory[];
+  fixedExpenses?: FixedExpenseSummary[];
+  incomes?: IncomeSummary[];
+  adjustments?: AdviceExpense[];
 }): Promise<string> {
   fs.mkdirSync(input.reportsDir, { recursive: true });
   const workbook = new ExcelJS.Workbook();
@@ -26,7 +31,9 @@ export async function createAvailabilityReport(input: {
   summary.addRows([
     { label: 'Periodo', value: input.period },
     { label: 'Presupuesto total', value: input.total },
-    { label: 'Gastado', value: input.spent },
+    { label: 'Gastado variable', value: input.variableSpent ?? input.spent },
+    { label: 'Gastos fijos', value: input.fixedSpent ?? 0 },
+    { label: 'Gastado total', value: input.spent },
     { label: 'Disponible', value: input.remaining }
   ]);
   styleSheet(summary);
@@ -46,6 +53,39 @@ export async function createAvailabilityReport(input: {
   for (const column of ['limit', 'spent', 'remaining']) {
     categories.getColumn(column).numFmt = '"$"#,##0';
   }
+
+  const fixed = workbook.addWorksheet('Gastos fijos');
+  fixed.columns = [
+    { header: 'Nombre', key: 'name', width: 28 },
+    { header: 'Importe', key: 'amount', width: 16 },
+    { header: 'Origen', key: 'source', width: 16 }
+  ];
+  fixed.addRows(input.fixedExpenses ?? []);
+  styleSheet(fixed);
+  fixed.getColumn('amount').numFmt = '"$"#,##0';
+
+  const incomes = workbook.addWorksheet('Ingresos');
+  incomes.columns = [
+    { header: 'Descripción', key: 'description', width: 32 },
+    { header: 'Categoría', key: 'category', width: 22 },
+    { header: 'Importe', key: 'amount', width: 16 },
+    { header: 'Fecha', key: 'incomeDate', width: 14 }
+  ];
+  incomes.addRows(input.incomes ?? []);
+  styleSheet(incomes);
+  incomes.getColumn('amount').numFmt = '"$"#,##0';
+
+  const adjustments = workbook.addWorksheet('Ajustes');
+  adjustments.columns = [
+    { header: 'ID', key: 'publicId', width: 14 },
+    { header: 'Descripción', key: 'description', width: 36 },
+    { header: 'Importe', key: 'amount', width: 16 },
+    { header: 'Estado', key: 'status', width: 14 },
+    { header: 'Fecha', key: 'expenseDate', width: 14 }
+  ];
+  adjustments.addRows(input.adjustments ?? []);
+  styleSheet(adjustments);
+  adjustments.getColumn('amount').numFmt = '"$"#,##0';
 
   const filePath = path.join(input.reportsDir, `disponibilidad-${sanitizeFilePart(input.period)}.xlsx`);
   await workbook.xlsx.writeFile(filePath);

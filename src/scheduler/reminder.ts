@@ -11,4 +11,13 @@ export function startDailyReminder(input: { timezone: string; whatsapp: WhatsApp
     },
     { timezone: input.timezone }
   );
+
+  cron.schedule(
+    '0 9 1 * *',
+    async () => {
+      if (!input.whatsapp.getSelectedGroup()) return;
+      await input.whatsapp.sendText(await input.engine.monthlyAnalysisText());
+    },
+    { timezone: input.timezone }
+  );
 }

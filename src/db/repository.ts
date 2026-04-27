@@ -1,11 +1,17 @@
 import { Db } from './database.js';
-import { currentPeriod } from '../utils/format.js';
+import { currentPeriod, nextPeriod } from '../utils/format.js';
 
 export type BudgetCategoryInput = {
   name: string;
   limit: number;
   kind: 'shared' | 'personal';
   personName?: string | null;
+};
+
+export type FixedExpenseInput = {
+  name: string;
+  amount: number;
+  source?: 'manual' | 'credit_card';
 };
 
 export type BudgetSummaryCategory = {
@@ -18,10 +24,36 @@ export type BudgetSummaryCategory = {
   remaining: number;
 };
 
+export type FixedExpenseSummary = {
+  id: number;
+  name: string;
+  amount: number;
+  source: 'manual' | 'credit_card';
+};
+
+export type IncomeSummary = {
+  id: number;
+  amount: number;
+  category: string | null;
+  description: string;
+  incomeDate: string;
+};
+
+export type GoalSummary = {
+  id: number;
+  title: string;
+  horizon: 'short' | 'medium' | 'long';
+  status: 'active' | 'done' | 'cancelled';
+  targetAmount: number | null;
+  targetDate: string | null;
+  notes: string | null;
+};
+
 export type AdviceExpense = {
   publicId: string;
   amount: number;
-  category: string;
+  category: string | null;
+  expenseType: string;
   description: string;
   status: string;
   expenseDate: string;
@@ -84,7 +116,7 @@ export class Repository {
     return this.ensurePerson(fallbackName?.trim() || jid.split('@')[0] || 'Persona', jid);
   }
 
-  upsertBudget(period: string, total: number, categories: BudgetCategoryInput[]): void {
+  upsertBudget(period: string, total: number, categories: BudgetCategoryInput[], fixedExpenses: FixedExpenseInput[] = []): void {
     const tx = this.db.transaction(() => {
       const totalCents = toCents(total);
       const row = this.db.prepare('SELECT id FROM budget_periods WHERE period = ?').get(period) as { id: number } | undefined;
@@ -108,6 +140,9 @@ export class Repository {
           )
           .run(periodId, category.name, toCents(category.limit), category.kind, personId);
       }
+      for (const fixed of fixedExpenses) {
+        this.upsertFixedExpenseByPeriodId(periodId, fixed.name, fixed.amount, fixed.source ?? 'manual');
+      }
     });
     tx();
   }
@@ -126,6 +161,29 @@ export class Repository {
       .all(periodId, name) as Array<{ id: number; kind: string; name: string; person_id: number | null }>;
     if (rows.length === 0) return undefined;
     return rows.find((row) => row.person_id === personId) ?? rows.find((row) => row.person_id == null) ?? rows[0];
+  }
+
+  ensureCategory(periodId: number, name: string, limit: number, kind: 'shared' | 'personal' = 'shared', personName?: string | null): number {
+    const existing = this.findCategory(periodId, name, personName ? this.ensurePerson(personName) : null);
+    if (existing) return existing.id;
+    const personId = kind === 'personal' && personName ? this.ensurePerson(personName) : null;
+    return Number(
+      this.db
+        .prepare('INSERT INTO budget_categories(period_id, name, limit_cents, kind, person_id) VALUES(?, ?, ?, ?, ?)')
+        .run(periodId, name, toCents(limit), kind, personId).lastInsertRowid
+    );
+  }
+
+  updateBudgetTotal(period: string, total: number): void {
+    this.db.prepare('UPDATE budget_periods SET total_cents = ?, updated_at = CURRENT_TIMESTAMP WHERE period = ?').run(toCents(total), period);
+  }
+
+  addToBudgetTotal(periodId: number, amount: number): void {
+    this.db.prepare('UPDATE budget_periods SET total_cents = total_cents + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(toCents(amount), periodId);
+  }
+
+  addToCategoryLimit(categoryId: number, amount: number): void {
+    this.db.prepare('UPDATE budget_categories SET limit_cents = limit_cents + ? WHERE id = ?').run(toCents(amount), categoryId);
   }
 
   createExpense(input: {
@@ -169,6 +227,94 @@ export class Repository {
     return { id, publicId };
   }
 
+  createAdjustmentExpense(input: {
+    amount: number;
+    description: string;
+    senderJid: string;
+    groupJid: string;
+    messageId: string;
+    date?: string | null;
+  }): { id: number; publicId: string } {
+    const period = this.activePeriod();
+    if (!period) throw new Error(`No hay presupuesto configurado para ${currentPeriod()}.`);
+    const publicId = `A${Date.now().toString(36).slice(-6).toUpperCase()}`;
+    const id = Number(
+      this.db
+        .prepare(
+          `INSERT INTO expenses(public_id, period_id, category_id, person_id, amount_cents, currency, description, expense_date, sender_jid, source_message_id, source_group_jid, receipt_path, expense_type)
+           VALUES(?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
+        )
+        .run(
+          publicId,
+          period.id,
+          toCents(input.amount),
+          period.currency,
+          input.description,
+          input.date ?? new Date().toISOString().slice(0, 10),
+          input.senderJid,
+          input.messageId,
+          input.groupJid,
+          'adjustment'
+        ).lastInsertRowid
+    );
+    this.addExpenseEvent(id, 'adjustment_created', input);
+    return { id, publicId };
+  }
+
+  registerIncome(input: {
+    amount: number;
+    description: string;
+    category?: string | null;
+    senderJid: string;
+    groupJid: string;
+    messageId: string;
+    date?: string | null;
+  }): { id: number; category: string } {
+    const period = this.activePeriod();
+    if (!period) throw new Error(`No hay presupuesto configurado para ${currentPeriod()}.`);
+    const categoryName = input.category?.trim() || 'Sin asignar';
+    const categoryId = this.ensureCategory(period.id, categoryName, 0);
+    const tx = this.db.transaction(() => {
+      this.addToBudgetTotal(period.id, input.amount);
+      this.addToCategoryLimit(categoryId, input.amount);
+      return Number(
+        this.db
+          .prepare(
+            `INSERT INTO incomes(period_id, category_id, amount_cents, currency, description, income_date, sender_jid, source_message_id, source_group_jid)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            period.id,
+            categoryId,
+            toCents(input.amount),
+            period.currency,
+            input.description,
+            input.date ?? new Date().toISOString().slice(0, 10),
+            input.senderJid,
+            input.messageId,
+            input.groupJid
+          ).lastInsertRowid
+      );
+    });
+    return { id: tx(), category: categoryName };
+  }
+
+  addCreditCardFixedExpense(cardName: string, amount: number, date = new Date()): { period: string; name: string; amount: number } {
+    const period = this.ensureBudgetPeriod(nextPeriod(date), this.currency);
+    const name = `Tarjeta ${cardName.trim()}`;
+    const existing = this.db
+      .prepare('SELECT id, amount_cents FROM fixed_expenses WHERE period_id = ? AND lower(name) = lower(?) AND source = ?')
+      .get(period.id, name, 'credit_card') as { id: number; amount_cents: number } | undefined;
+    if (existing) {
+      this.db
+        .prepare('UPDATE fixed_expenses SET amount_cents = amount_cents + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(toCents(amount), existing.id);
+      return { period: period.period, name, amount: fromCents(existing.amount_cents + toCents(amount)) };
+    }
+    this.upsertFixedExpenseByPeriodId(period.id, name, amount, 'credit_card');
+    return { period: period.period, name, amount };
+  }
+
   cancelExpense(ref: string | null, senderJid: string): { publicId: string; amount: number; description: string } | undefined {
     const row = ref
       ? (this.db
@@ -190,8 +336,8 @@ export class Repository {
   recentExpenses(limit = 8): Array<{ publicId: string; amount: number; category: string; description: string; status: string; createdAt: string }> {
     return this.db
       .prepare(
-        `SELECT e.public_id, e.amount_cents, c.name category, e.description, e.status, e.created_at
-         FROM expenses e JOIN budget_categories c ON c.id = e.category_id
+        `SELECT e.public_id, e.amount_cents, COALESCE(c.name, e.expense_type) category, e.description, e.status, e.created_at
+         FROM expenses e LEFT JOIN budget_categories c ON c.id = e.category_id
          ORDER BY e.created_at DESC LIMIT ?`
       )
       .all(limit)
@@ -208,15 +354,16 @@ export class Repository {
   recentExpensesForAdvice(limit = 12): AdviceExpense[] {
     return this.db
       .prepare(
-        `SELECT e.public_id, e.amount_cents, c.name category, e.description, e.status, e.expense_date, e.created_at
-         FROM expenses e JOIN budget_categories c ON c.id = e.category_id
+        `SELECT e.public_id, e.amount_cents, c.name category, e.expense_type, e.description, e.status, e.expense_date, e.created_at
+         FROM expenses e LEFT JOIN budget_categories c ON c.id = e.category_id
          ORDER BY e.created_at DESC LIMIT ?`
       )
       .all(limit)
       .map((row: any) => ({
         publicId: row.public_id,
         amount: fromCents(row.amount_cents),
-        category: row.category,
+        category: row.category ?? null,
+        expenseType: row.expense_type,
         description: row.description,
         status: row.status,
         expenseDate: row.expense_date,
@@ -224,19 +371,20 @@ export class Repository {
       }));
   }
 
-  budgetSummary(date = new Date()): { period: string; total: number; spent: number; remaining: number; categories: BudgetSummaryCategory[] } | undefined {
+  budgetSummary(date = new Date()): { period: string; total: number; spent: number; fixedSpent: number; variableSpent: number; remaining: number; categories: BudgetSummaryCategory[]; fixedExpenses: FixedExpenseSummary[]; incomes: IncomeSummary[]; adjustments: AdviceExpense[] } | undefined {
     const period = this.activePeriod(date);
     if (!period) return undefined;
     const spentRow = this.db
       .prepare('SELECT COALESCE(SUM(amount_cents), 0) spent FROM expenses WHERE period_id = ? AND status = ?')
       .get(period.id, 'active') as { spent: number };
+    const fixedRow = this.db.prepare('SELECT COALESCE(SUM(amount_cents), 0) spent FROM fixed_expenses WHERE period_id = ?').get(period.id) as { spent: number };
     const categories = this.db
       .prepare(
         `SELECT c.id, c.name, c.kind, p.name person_name, c.limit_cents,
                 COALESCE(SUM(CASE WHEN e.status = 'active' THEN e.amount_cents ELSE 0 END), 0) spent_cents
          FROM budget_categories c
          LEFT JOIN people p ON p.id = c.person_id
-         LEFT JOIN expenses e ON e.category_id = c.id
+         LEFT JOIN expenses e ON e.category_id = c.id AND e.expense_type = 'regular'
          WHERE c.period_id = ?
          GROUP BY c.id
          ORDER BY c.name`
@@ -252,7 +400,11 @@ export class Repository {
         remaining: fromCents(row.limit_cents - row.spent_cents)
       }));
     const spent = fromCents(spentRow.spent);
-    return { period: period.period, total: period.total, spent, remaining: period.total - spent, categories };
+    const fixedSpent = fromCents(fixedRow.spent);
+    const fixedExpenses = this.fixedExpensesForPeriod(period.id);
+    const incomes = this.incomesForPeriod(period.id);
+    const adjustments = this.adjustmentsForPeriod(period.id);
+    return { period: period.period, total: period.total, spent: spent + fixedSpent, fixedSpent, variableSpent: spent, remaining: period.total - spent - fixedSpent, categories, fixedExpenses, incomes, adjustments };
   }
 
   financialContextForCurrentPeriod(date = new Date()):
@@ -260,8 +412,13 @@ export class Repository {
         period: string;
         total: number;
         spent: number;
+        fixedSpent: number;
+        variableSpent: number;
         remaining: number;
         categories: BudgetSummaryCategory[];
+        fixedExpenses: FixedExpenseSummary[];
+        incomes: IncomeSummary[];
+        adjustments: AdviceExpense[];
       }
     | undefined {
     return this.budgetSummary(date);
@@ -301,8 +458,152 @@ export class Repository {
       .run(input.messageId, input.intent ?? null, input.confidence ?? null, input.promptTokens ?? null, input.outputTokens ?? null, input.rawJson ?? null, input.error ?? null);
   }
 
+  previousBudget(period: string): { period: string; total: number; categories: BudgetCategoryInput[]; fixedExpenses: FixedExpenseInput[] } | undefined {
+    const row = this.db
+      .prepare('SELECT id, period, total_cents FROM budget_periods WHERE period < ? ORDER BY period DESC LIMIT 1')
+      .get(period) as { id: number; period: string; total_cents: number } | undefined;
+    if (!row) return undefined;
+    const categories = this.db
+      .prepare(
+        `SELECT c.name, c.limit_cents, c.kind, p.name person_name
+         FROM budget_categories c LEFT JOIN people p ON p.id = c.person_id
+         WHERE c.period_id = ? ORDER BY c.name`
+      )
+      .all(row.id)
+      .map((item: any) => ({ name: item.name, limit: fromCents(item.limit_cents), kind: item.kind, personName: item.person_name ?? null }));
+    return { period: row.period, total: fromCents(row.total_cents), categories, fixedExpenses: this.fixedExpensesForPeriod(row.id).map((item) => ({ name: item.name, amount: item.amount, source: item.source })) };
+  }
+
+  savePendingConfirmation(input: { groupJid: string; senderJid?: string | null; type: string; payload: unknown; ttlMinutes?: number }): void {
+    const expiresAt = new Date(Date.now() + (input.ttlMinutes ?? 60) * 60 * 1000).toISOString();
+    this.db
+      .prepare('INSERT INTO pending_confirmations(group_jid, sender_jid, confirmation_type, payload_json, expires_at) VALUES(?, ?, ?, ?, ?)')
+      .run(input.groupJid, input.senderJid ?? null, input.type, JSON.stringify(input.payload), expiresAt);
+  }
+
+  consumePendingConfirmation(groupJid: string, senderJid?: string | null): { id: number; type: string; payload: any } | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT id, confirmation_type, payload_json FROM pending_confirmations
+         WHERE group_jid = ? AND (sender_jid IS NULL OR sender_jid = ?) AND (expires_at IS NULL OR expires_at > ?)
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(groupJid, senderJid ?? null, new Date().toISOString()) as { id: number; confirmation_type: string; payload_json: string } | undefined;
+    if (!row) return undefined;
+    this.db.prepare('DELETE FROM pending_confirmations WHERE id = ?').run(row.id);
+    return { id: row.id, type: row.confirmation_type, payload: JSON.parse(row.payload_json) };
+  }
+
+  createGoal(input: { title: string; horizon: 'short' | 'medium' | 'long'; amount?: number | null; targetDate?: string | null; notes?: string | null; status?: 'active' | 'done' | 'cancelled' | null }): number {
+    return Number(
+      this.db
+        .prepare('INSERT INTO goals(title, horizon, status, target_amount_cents, target_date, notes) VALUES(?, ?, ?, ?, ?, ?)')
+        .run(input.title, input.horizon, input.status ?? 'active', input.amount == null ? null : toCents(input.amount), input.targetDate ?? null, input.notes ?? null).lastInsertRowid
+    );
+  }
+
+  updateGoal(input: { title: string; horizon?: 'short' | 'medium' | 'long' | null; amount?: number | null; targetDate?: string | null; notes?: string | null; status?: 'active' | 'done' | 'cancelled' | null }): boolean {
+    const existing = this.findGoalByTitle(input.title);
+    if (!existing) return false;
+    this.db
+      .prepare(
+        `UPDATE goals
+         SET horizon = COALESCE(?, horizon),
+             status = COALESCE(?, status),
+             target_amount_cents = COALESCE(?, target_amount_cents),
+             target_date = COALESCE(?, target_date),
+             notes = COALESCE(?, notes),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`
+      )
+      .run(input.horizon ?? null, input.status ?? null, input.amount == null ? null : toCents(input.amount), input.targetDate ?? null, input.notes ?? null, existing.id);
+    return true;
+  }
+
+  deleteGoal(title: string): boolean {
+    const result = this.db.prepare('UPDATE goals SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE lower(title) = lower(?) AND status != ?').run('cancelled', title, 'cancelled');
+    return result.changes > 0;
+  }
+
+  goals(status: 'active' | 'all' = 'active'): GoalSummary[] {
+    const sql =
+      status === 'active'
+        ? 'SELECT * FROM goals WHERE status = ? ORDER BY horizon, created_at'
+        : 'SELECT * FROM goals ORDER BY status, horizon, created_at';
+    const rows = status === 'active' ? this.db.prepare(sql).all('active') : this.db.prepare(sql).all();
+    return rows.map((row: any) => ({
+      id: row.id,
+      title: row.title,
+      horizon: row.horizon,
+      status: row.status,
+      targetAmount: row.target_amount_cents == null ? null : fromCents(row.target_amount_cents),
+      targetDate: row.target_date ?? null,
+      notes: row.notes ?? null
+    }));
+  }
+
   private addExpenseEvent(expenseId: number, eventType: string, payload: unknown): void {
     this.db.prepare('INSERT INTO expense_events(expense_id, event_type, payload_json) VALUES(?, ?, ?)').run(expenseId, eventType, JSON.stringify(payload));
+  }
+
+  private ensureBudgetPeriod(period: string, currency: string): { id: number; period: string } {
+    const existing = this.db.prepare('SELECT id, period FROM budget_periods WHERE period = ?').get(period) as { id: number; period: string } | undefined;
+    if (existing) return existing;
+    const id = Number(this.db.prepare('INSERT INTO budget_periods(period, total_cents, currency) VALUES(?, 0, ?)').run(period, currency).lastInsertRowid);
+    return { id, period };
+  }
+
+  private upsertFixedExpenseByPeriodId(periodId: number, name: string, amount: number, source: 'manual' | 'credit_card'): void {
+    this.db
+      .prepare(
+        `INSERT INTO fixed_expenses(period_id, name, amount_cents, source)
+         VALUES(?, ?, ?, ?)
+         ON CONFLICT(period_id, name, source) DO UPDATE SET amount_cents = excluded.amount_cents, updated_at = CURRENT_TIMESTAMP`
+      )
+      .run(periodId, name, toCents(amount), source);
+  }
+
+  private fixedExpensesForPeriod(periodId: number): FixedExpenseSummary[] {
+    return this.db
+      .prepare('SELECT id, name, amount_cents, source FROM fixed_expenses WHERE period_id = ? ORDER BY name')
+      .all(periodId)
+      .map((row: any) => ({ id: row.id, name: row.name, amount: fromCents(row.amount_cents), source: row.source }));
+  }
+
+  private incomesForPeriod(periodId: number): IncomeSummary[] {
+    return this.db
+      .prepare(
+        `SELECT i.id, i.amount_cents, c.name category, i.description, i.income_date
+         FROM incomes i LEFT JOIN budget_categories c ON c.id = i.category_id
+         WHERE i.period_id = ? ORDER BY i.created_at DESC`
+      )
+      .all(periodId)
+      .map((row: any) => ({ id: row.id, amount: fromCents(row.amount_cents), category: row.category ?? null, description: row.description, incomeDate: row.income_date }));
+  }
+
+  private adjustmentsForPeriod(periodId: number): AdviceExpense[] {
+    return this.db
+      .prepare(
+        `SELECT public_id, amount_cents, expense_type, description, status, expense_date, created_at
+         FROM expenses WHERE period_id = ? AND expense_type = 'adjustment' ORDER BY created_at DESC`
+      )
+      .all(periodId)
+      .map((row: any) => ({
+        publicId: row.public_id,
+        amount: fromCents(row.amount_cents),
+        category: null,
+        expenseType: row.expense_type,
+        description: row.description,
+        status: row.status,
+        expenseDate: row.expense_date,
+        createdAt: row.created_at
+      }));
+  }
+
+  private findGoalByTitle(title: string): { id: number } | undefined {
+    return this.db.prepare('SELECT id FROM goals WHERE lower(title) = lower(?) AND status != ? ORDER BY created_at DESC LIMIT 1').get(title, 'cancelled') as
+      | { id: number }
+      | undefined;
   }
 }
 

@@ -6,6 +6,7 @@ const context = {
   currentPeriod: undefined,
   recentExpenses: [],
   categoryTrends: [],
+  goals: [],
   alerts: ['No hay presupuesto configurado para el periodo actual.']
 };
 
@@ -15,8 +16,9 @@ describe('CodexAdviceClient', () => {
       { codexBin: 'codex', repoRoot: 'C:/repo', model: 'gpt-test', timeoutMs: 123 },
       async (input) => {
         expect(input.command).toBe('codex');
-        expect(input.args).toEqual(['exec', '--skip-git-repo-check', '--ephemeral', '-s', 'read-only', '-C', 'C:/repo', '-m', 'gpt-test', '-']);
+        expect(input.args).toEqual(['exec', '--skip-git-repo-check', '--ephemeral', '--full-auto', '-s', 'workspace-write', '-C', 'C:/repo', '-m', 'gpt-test', '-']);
         expect(input.stdin).toContain('Pregunta del usuario');
+        expect(input.stdin).toContain('Actuá en modo agente');
         return { code: 0, stdout: 'ok', stderr: '', timedOut: false };
       }
     );

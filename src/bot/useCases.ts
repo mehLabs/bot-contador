@@ -1,9 +1,9 @@
 import { CodexAdviceClient } from '../advice/codexAdviceClient.js';
 import { FinancialContextBuilder } from '../advice/financialContext.js';
-import { Repository } from '../db/repository.js';
+import { BudgetCategoryInput, FixedExpenseInput, Repository } from '../db/repository.js';
 import { createAvailabilityReport } from '../report/excel.js';
 import { BotReply, IncomingMessage, ParsedMessage } from '../types.js';
-import { currentPeriod, formatMoney } from '../utils/format.js';
+import { currentPeriod, formatMoney, nextPeriod } from '../utils/format.js';
 
 export class UseCaseEngine {
   constructor(
@@ -16,12 +16,23 @@ export class UseCaseEngine {
     switch (parsed.intent) {
       case 'register_expense':
         return this.registerExpense(message, parsed);
+      case 'register_credit_card_expense':
+        return this.registerCreditCardExpense(message, parsed);
       case 'cancel_expense':
         return this.cancelExpense(message, parsed);
       case 'availability':
         return this.availability(true);
       case 'setup_budget':
-        return this.setupBudget(parsed);
+      case 'update_budget':
+        return this.setupBudget(message, parsed, currentPeriod());
+      case 'setup_next_budget':
+        return this.setupBudget(message, parsed, nextPeriod());
+      case 'register_income':
+        return this.registerIncome(message, parsed);
+      case 'adjust_remaining':
+        return this.adjustRemaining(message, parsed);
+      case 'manage_goal':
+        return this.manageGoal(parsed);
       case 'list_recent':
         return this.listRecent();
       case 'identify_person':
@@ -32,7 +43,7 @@ export class UseCaseEngine {
       case 'bot_question':
         return this.financialAdvice(message);
       case 'confirm':
-        return { text: 'Recibido. Si querés que registre o cambie algo, mandame el monto, la categoría y una descripción corta.' };
+        return this.confirmPending(message);
       case 'correct_expense':
         return { text: 'Puedo corregir gastos, pero necesito que indiques el ID del gasto y el nuevo monto, categoría o descripción.' };
       case 'unknown':
@@ -43,6 +54,22 @@ export class UseCaseEngine {
 
   reminderText(): string {
     return 'Cierre del día: si hicieron gastos hoy, pásenlos por acá y los registro.';
+  }
+
+  async monthlyAnalysisText(): Promise<string> {
+    const goals = this.repo.goals('active');
+    const goalsText = goals.length
+      ? `Metas activas: ${goals.map((goal) => `${horizonLabel(goal.horizon)}: ${goal.title}`).join('; ')}.`
+      : 'No hay metas activas registradas.';
+    if (!this.adviceClient) {
+      return `Arranca un nuevo mes. Actualizá tus metas de corto, mediano y largo plazo. ${goalsText}`;
+    }
+    const context = new FinancialContextBuilder(this.repo).build();
+    const advice = await this.adviceClient.advise(
+      'Hacé el análisis mensual del periodo cerrado o vigente según el contexto. Evaluá especialmente metas de corto plazo y cualquier meta mediana/larga que afecte decisiones del mes. Cerrá pidiendo actualización de metas.',
+      context
+    );
+    return `${advice}\n\nActualizá tus metas de corto, mediano y largo plazo cuando puedas.`;
   }
 
   async availability(withAttachment: boolean): Promise<BotReply> {
@@ -70,12 +97,17 @@ export class UseCaseEngine {
           currency: this.options.currency,
           total: summary.total,
           spent: summary.spent,
+          fixedSpent: summary.fixedSpent,
+          variableSpent: summary.variableSpent,
           remaining: summary.remaining,
-          categories: summary.categories
+          categories: summary.categories,
+          fixedExpenses: summary.fixedExpenses,
+          incomes: summary.incomes,
+          adjustments: summary.adjustments
         })
       : undefined;
 
-    return { text: lines.join('\n'), attachmentPath };
+    return { text: lines.join('\n'), attachmentPath, actionTaken: true };
   }
 
   help(): BotReply {
@@ -87,7 +119,11 @@ export class UseCaseEngine {
         '- Cancelar gasto: “cancelá el gasto GABC12” o “borrá mi último gasto”.',
         '- Consultar disponibilidad: “cuánto queda”.',
         '- Exportar Excel: pedí disponibilidad y adjunto el reporte.',
-        '- Configurar presupuesto: “presupuesto abril 150000, comida 20000, transporte 30000”.',
+        '- Configurar presupuesto: “presupuesto 150000, comida 20000, transporte 30000”.',
+        '- Registrar ingreso: “cobré 200000 de sueldo”.',
+        '- Ajustar disponible: “me quedan 50000 pesos”.',
+        '- Gasto con tarjeta: “gasté 30000 con Visa”.',
+        '- Gestionar metas: “creá una meta corta para juntar 100000”.',
         '- Listar gastos recientes: “últimos gastos”.',
         '- Pedir consejos financieros: “dame consejos para no pasarme este mes”.',
         '- Ver esta ayuda: “comandos” o “qué podés hacer”.'
@@ -101,7 +137,7 @@ export class UseCaseEngine {
     }
     const context = new FinancialContextBuilder(this.repo).build();
     const advice = await this.adviceClient.advise(message.text || 'Dame consejos financieros sobre el presupuesto actual.', context);
-    return { text: advice };
+    return { text: advice, actionTaken: true };
   }
 
   private registerExpense(message: IncomingMessage, parsed: ParsedMessage): BotReply {
@@ -127,7 +163,21 @@ export class UseCaseEngine {
     const categoryText = category ? ` En ${category.name}, ${formatRemaining(category.remaining, this.options.currency)}.` : '';
     const totalText = summary ? ` Quedan ${formatMoney(Math.max(summary.remaining, 0), this.options.currency)} disponibles este mes.` : '';
     return {
-      text: `Registré ${formatMoney(parsed.amount!, this.options.currency)} en ${parsed.category} (${expense.publicId}).${totalText}${categoryText}`
+      text: `Registré ${formatMoney(parsed.amount!, this.options.currency)} en ${parsed.category} (${expense.publicId}).${totalText}${categoryText}`,
+      actionTaken: true
+    };
+  }
+
+  private registerCreditCardExpense(message: IncomingMessage, parsed: ParsedMessage): BotReply {
+    const missing = requiredMissing(parsed, ['amount']);
+    const cardName = parsed.creditCard?.name ?? parsed.category;
+    if (missing.length > 0 || !cardName || parsed.confidence < 0.55 || parsed.needsConfirmation) {
+      return { text: `Necesito monto y tarjeta para registrar el gasto con crédito. Ejemplo: “gasté 30000 con Visa”.` };
+    }
+    const fixed = this.repo.addCreditCardFixedExpense(cardName, parsed.amount!, message.timestamp);
+    return {
+      text: `Anoté ${formatMoney(parsed.amount!, this.options.currency)} para ${fixed.name}. Queda como gasto fijo de ${fixed.period}: ${formatMoney(fixed.amount, this.options.currency)} acumulados.`,
+      actionTaken: true
     };
   }
 
@@ -138,23 +188,135 @@ export class UseCaseEngine {
     }
     const summary = this.repo.budgetSummary();
     const totalText = summary ? ` Disponible general actualizado: ${formatMoney(summary.remaining, this.options.currency)}.` : '';
-    return { text: `Cancelé ${cancelled.publicId}: ${cancelled.description} por ${formatMoney(cancelled.amount, this.options.currency)}.${totalText}` };
+    return { text: `Cancelé ${cancelled.publicId}: ${cancelled.description} por ${formatMoney(cancelled.amount, this.options.currency)}.${totalText}`, actionTaken: true };
   }
 
-  private setupBudget(parsed: ParsedMessage): BotReply {
+  private setupBudget(message: IncomingMessage, parsed: ParsedMessage, forcedPeriod: string): BotReply {
     if (!parsed.budget?.total || parsed.budget.categories.length === 0) {
       return { text: 'Para configurar el presupuesto necesito el total mensual y al menos una categoría con su monto.' };
     }
-    const period = parsed.budget.period ?? currentPeriod();
-    this.repo.upsertBudget(period, parsed.budget.total, parsed.budget.categories);
+    const period = forcedPeriod;
+    const categories = parsed.budget.categories;
+    const fixedExpenses = parsed.budget.fixedExpenses ?? [];
+    const assigned = totalBudgetItems(categories, fixedExpenses);
+    if (assigned > parsed.budget.total) {
+      const hole = assigned - parsed.budget.total;
+      this.repo.savePendingConfirmation({
+        groupJid: message.groupJid,
+        senderJid: message.senderJid,
+        type: 'overbudget',
+        payload: { period, total: parsed.budget.total, categories, fixedExpenses, hole }
+      });
+      return {
+        text: `Alerta: ese presupuesto queda excedido por ${formatMoney(hole, this.options.currency)} antes de guardarlo. Si querés guardarlo igual, respondé “confirmo”.`
+      };
+    }
+    this.repo.upsertBudget(period, parsed.budget.total, categories, fixedExpenses);
     const personal = parsed.budget.categories.filter((category) => category.kind === 'personal' && category.personName);
     const nextIdentification = personal.find((category) => category.personName);
     const suffix = nextIdentification
       ? ` Necesito identificar a las personas del presupuesto. ${nextIdentification.personName}, respondé “yo”.`
       : '';
+    const previous = period === currentPeriod() ? this.repo.previousBudget(period) : undefined;
+    const previousHint = previous
+      ? ` Gastos fijos del presupuesto anterior: ${previous.fixedExpenses.length ? previous.fixedExpenses.map((item) => `${item.name} ${formatMoney(item.amount, this.options.currency)}`).join(', ') : 'ninguno'}. Si querés, puedo usar ${previous.period} como base cuando armes el próximo.`
+      : '';
     return {
-      text: `Presupuesto de ${period} configurado: ${formatMoney(parsed.budget.total, this.options.currency)} en ${parsed.budget.categories.length} categorías.${suffix}`
+      text: `Presupuesto de ${period} configurado: ${formatMoney(parsed.budget.total, this.options.currency)} en ${parsed.budget.categories.length} categorías y ${fixedExpenses.length} gastos fijos.${suffix}${previousHint}`,
+      actionTaken: true
     };
+  }
+
+  private confirmPending(message: IncomingMessage): BotReply {
+    const pending = this.repo.consumePendingConfirmation(message.groupJid, message.senderJid);
+    if (!pending) {
+      return { text: 'Recibido. Si querés que registre o cambie algo, mandame el monto, la categoría y una descripción corta.' };
+    }
+    if (pending.type === 'overbudget') {
+      const payload = pending.payload as { period: string; total: number; categories: BudgetCategoryInput[]; fixedExpenses: FixedExpenseInput[]; hole: number };
+      this.repo.upsertBudget(payload.period, payload.total, payload.categories, payload.fixedExpenses);
+      this.repo.createGoal({
+        title: `Cubrir hueco financiero de ${payload.period}`,
+        horizon: 'short',
+        amount: payload.hole,
+        notes: 'Meta automática creada por presupuesto excedido. Cubrir sin tomar deuda.'
+      });
+      return {
+        text: `Guardé el presupuesto de ${payload.period}. También creé una meta corta para cubrir ${formatMoney(payload.hole, this.options.currency)} sin deuda.`,
+        actionTaken: true
+      };
+    }
+    return { text: 'Confirmación recibida, pero no encontré una acción compatible para ejecutar.' };
+  }
+
+  private registerIncome(message: IncomingMessage, parsed: ParsedMessage): BotReply {
+    const amount = parsed.income?.amount ?? parsed.amount;
+    if (!amount || parsed.confidence < 0.55 || parsed.needsConfirmation) {
+      return { text: 'Necesito el monto del ingreso para sumarlo al presupuesto actual.' };
+    }
+    const result = this.repo.registerIncome({
+      amount,
+      category: parsed.income?.category ?? parsed.category,
+      description: parsed.income?.description ?? parsed.description ?? (message.text || 'Ingreso'),
+      senderJid: message.senderJid,
+      groupJid: message.groupJid,
+      messageId: message.id,
+      date: parsed.date
+    });
+    const summary = this.repo.budgetSummary();
+    return {
+      text: `Sumé un ingreso de ${formatMoney(amount, this.options.currency)}. Lo asigné a ${result.category}. Disponible: ${summary ? formatMoney(summary.remaining, this.options.currency) : 'sin presupuesto activo'}.`,
+      actionTaken: true
+    };
+  }
+
+  private adjustRemaining(message: IncomingMessage, parsed: ParsedMessage): BotReply {
+    if (!parsed.amount || parsed.confidence < 0.55 || parsed.needsConfirmation) {
+      return { text: 'Necesito saber cuánto dinero te queda para ajustar el disponible mensual.' };
+    }
+    const summary = this.repo.budgetSummary();
+    if (!summary) return { text: `Todavía no hay presupuesto configurado para ${currentPeriod()}.` };
+    const delta = summary.remaining - parsed.amount;
+    if (delta <= 0) {
+      return { text: `El disponible calculado ya es menor o igual a ${formatMoney(parsed.amount, this.options.currency)}. No hago ajuste automático para aumentar saldo; registrá un ingreso si entró plata.` };
+    }
+    const expense = this.repo.createAdjustmentExpense({
+      amount: delta,
+      description: parsed.description ?? `Ajuste por saldo declarado: quedan ${formatMoney(parsed.amount, this.options.currency)}`,
+      senderJid: message.senderJid,
+      groupJid: message.groupJid,
+      messageId: message.id,
+      date: parsed.date
+    });
+    return {
+      text: `Registré un ajuste desconocido de ${formatMoney(delta, this.options.currency)} (${expense.publicId}). Ahora quedan ${formatMoney(parsed.amount, this.options.currency)}.`,
+      actionTaken: true
+    };
+  }
+
+  private manageGoal(parsed: ParsedMessage): BotReply {
+    const goal = parsed.goal;
+    if (!goal) return { text: 'Decime qué querés hacer con tus metas: crear, modificar, borrar o listar.' };
+    if (goal.action === 'list') {
+      const goals = this.repo.goals('active');
+      return {
+        text: goals.length
+          ? ['Metas activas:', ...goals.map((item) => `- ${horizonLabel(item.horizon)}: ${item.title}${item.targetAmount ? ` (${formatMoney(item.targetAmount, this.options.currency)})` : ''}`)].join('\n')
+          : 'No hay metas activas.',
+        actionTaken: true
+      };
+    }
+    if (!goal.title) return { text: 'Necesito el nombre o título de la meta.' };
+    if (goal.action === 'delete') {
+      const deleted = this.repo.deleteGoal(goal.title);
+      return { text: deleted ? `Borré la meta “${goal.title}”.` : `No encontré una meta activa llamada “${goal.title}”.`, actionTaken: deleted };
+    }
+    if (goal.action === 'update') {
+      const updated = this.repo.updateGoal({ title: goal.title, horizon: goal.horizon, amount: goal.amount, targetDate: goal.targetDate, notes: goal.notes, status: goal.status });
+      return { text: updated ? `Actualicé la meta “${goal.title}”.` : `No encontré una meta activa llamada “${goal.title}”.`, actionTaken: updated };
+    }
+    const id = this.repo.createGoal({ title: goal.title, horizon: goal.horizon ?? 'short', amount: goal.amount, targetDate: goal.targetDate, notes: goal.notes, status: goal.status });
+    return { text: `Creé la meta “${goal.title}” (#${id}).`, actionTaken: true };
   }
 
   private listRecent(): BotReply {
@@ -171,7 +333,7 @@ export class UseCaseEngine {
     }
     const name = parsed.personName ?? message.senderName ?? message.senderJid.split('@')[0] ?? 'Persona';
     this.repo.identifyPerson(name, message.senderJid);
-    return { text: `Listo, asocié este número con ${name}.` };
+    return { text: `Listo, asocié este número con ${name}.`, actionTaken: true };
   }
 }
 
@@ -183,4 +345,14 @@ function requiredMissing(parsed: ParsedMessage, fields: Array<'amount' | 'catego
 function formatRemaining(value: number, currency: string): string {
   if (value >= 0) return `${formatMoney(value, currency)} disponibles`;
   return `excedido por ${formatMoney(Math.abs(value), currency)}`;
+}
+
+function totalBudgetItems(categories: BudgetCategoryInput[], fixedExpenses: FixedExpenseInput[]): number {
+  return categories.reduce((sum, item) => sum + item.limit, 0) + fixedExpenses.reduce((sum, item) => sum + item.amount, 0);
+}
+
+function horizonLabel(value: string): string {
+  if (value === 'short') return 'corto plazo';
+  if (value === 'medium') return 'mediano plazo';
+  return 'largo plazo';
 }
