@@ -3,6 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { FinancialAdviceContext } from './financialContext.js';
 
+export type CategoryMatchResult = {
+  matchedCategory: string | null;
+  confidence: number;
+  reason: string;
+};
+
 export type CodexAdviceOptions = {
   codexBin: string;
   repoRoot: string;
@@ -49,6 +55,28 @@ export class CodexAdviceClient {
     return answer || 'Codex respondió sin contenido. Probá reformular la consulta.';
   }
 
+  async matchCategory(input: { requestedCategory: string; categories: string[]; messageText: string }): Promise<CategoryMatchResult> {
+    const prompt = this.buildCategoryMatchPrompt(input);
+    const args = ['exec', '--skip-git-repo-check', '--ephemeral', '--full-auto', '-s', 'workspace-write', '-C', this.options.repoRoot];
+    if (this.options.model) args.push('-m', this.options.model);
+    args.push('-');
+
+    const result = await this.runner({
+      command: this.options.codexBin,
+      args,
+      cwd: this.options.repoRoot,
+      stdin: prompt,
+      timeoutMs: this.options.timeoutMs
+    });
+
+    if (result.timedOut || result.code !== 0) return noCategoryMatch('No se pudo consultar el agente.');
+    const parsed = parseCategoryMatch(result.stdout);
+    if (!parsed) return noCategoryMatch('El agente no devolvió JSON válido.');
+    const existing = input.categories.find((category) => category.toLowerCase() === parsed.matchedCategory?.toLowerCase());
+    if (!existing) return { matchedCategory: null, confidence: parsed.confidence, reason: parsed.reason || 'La categoría sugerida no existe.' };
+    return { matchedCategory: existing, confidence: parsed.confidence, reason: parsed.reason };
+  }
+
   buildPrompt(question: string, context: FinancialAdviceContext): string {
     const systemBrief = this.readSystemBrief();
     return [
@@ -64,6 +92,7 @@ export class CodexAdviceClient {
       '- Actuá en nombre de la persona que hizo la solicitud, respetando el alcance del presupuesto compartido.',
       '- No hagas cambios destructivos ni irreversibles salvo que la solicitud lo pida de forma explícita.',
       '- No pidas SQL al usuario; si necesitás revisar datos, usá las herramientas locales disponibles y explicá qué hiciste.',
+      '- Los gastos con tarjeta de crédito cargados este mes cuentan como gastos fijos del periodo siguiente; revisá nextPeriod antes de decir que no existen.',
       '',
       `Pregunta del usuario:\n${question}`,
       '',
@@ -71,6 +100,19 @@ export class CodexAdviceClient {
     ]
       .filter(Boolean)
       .join('\n\n');
+  }
+
+  buildCategoryMatchPrompt(input: { requestedCategory: string; categories: string[]; messageText: string }): string {
+    return [
+      'Sos un matcher estricto de categorías de presupuesto.',
+      'Respondé solo JSON válido con esta forma exacta: {"matchedCategory": string|null, "confidence": number, "reason": string}.',
+      'matchedCategory debe ser null o una de las categorías existentes, copiando el nombre exacto.',
+      'Usá null si no hay una coincidencia clara o si la categoría pedida parece una categoría nueva.',
+      'No inventes categorías.',
+      `Categoría pedida: ${input.requestedCategory}`,
+      `Mensaje original: ${input.messageText || '(sin texto)'}`,
+      `Categorías existentes JSON: ${JSON.stringify(input.categories)}`
+    ].join('\n');
   }
 
   private readSystemBrief(): string | undefined {
@@ -123,4 +165,30 @@ export function runProcess(input: {
 
 function compactError(value: string): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, 500) || 'sin detalle';
+}
+
+function parseCategoryMatch(value: string): CategoryMatchResult | undefined {
+  try {
+    const parsed = JSON.parse(extractJsonObject(value));
+    const confidence = typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence) ? Math.max(0, Math.min(1, parsed.confidence)) : 0;
+    return {
+      matchedCategory: typeof parsed.matchedCategory === 'string' && parsed.matchedCategory.trim() ? parsed.matchedCategory.trim() : null,
+      confidence,
+      reason: typeof parsed.reason === 'string' ? parsed.reason.trim() : ''
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function extractJsonObject(value: string): string {
+  const trimmed = value.trim();
+  const start = trimmed.indexOf('{');
+  const end = trimmed.lastIndexOf('}');
+  if (start === -1 || end === -1 || end < start) return trimmed;
+  return trimmed.slice(start, end + 1);
+}
+
+function noCategoryMatch(reason: string): CategoryMatchResult {
+  return { matchedCategory: null, confidence: 0, reason };
 }

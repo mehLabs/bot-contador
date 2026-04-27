@@ -26,4 +26,13 @@ describe('ParsedMessageSchema', () => {
     expect(parsed.income?.amount).toBe(20000);
     expect(parsed.creditCard?.name).toBe('Visa');
   });
+
+  it('acepta disponibilidad con categoría', () => {
+    const parsed = ParsedMessageSchema.parse({
+      intent: 'availability',
+      confidence: 1,
+      category: 'Comida'
+    });
+    expect(parsed.category).toBe('Comida');
+  });
 });

@@ -102,6 +102,29 @@ describe('UseCaseEngine', () => {
     expect(fs.existsSync(reply.attachmentPath!)).toBe(true);
   });
 
+  it('consulta disponibilidad de una categoría específica sin adjunto', async () => {
+    const { repo, engine } = setup();
+    repo.upsertBudget('2026-04', 100000, [
+      { name: 'Comida', limit: 30000, kind: 'shared' },
+      { name: 'Transporte', limit: 20000, kind: 'shared' }
+    ]);
+    repo.createExpense({
+      amount: 12000,
+      category: 'Comida',
+      description: 'super',
+      personId: repo.personForSender(baseMessage.senderJid, baseMessage.senderName),
+      senderJid: baseMessage.senderJid,
+      groupJid: baseMessage.groupJid,
+      messageId: baseMessage.id,
+      date: '2026-04-26'
+    });
+    const reply = await engine.availability(true, 'Comida');
+    expect(reply.attachmentPath).toBeUndefined();
+    expect(reply.text).toContain('Disponibilidad de Comida');
+    expect(reply.text).toContain('18.000');
+    expect(reply.text).not.toContain('Transporte');
+  });
+
   it('arma contexto financiero seguro con alertas', () => {
     const { repo } = setup();
     repo.upsertBudget('2026-04', 100000, [{ name: 'Comida', limit: 20000, kind: 'shared' }]);
@@ -139,6 +162,92 @@ describe('UseCaseEngine', () => {
       confidence: 0.9,
     }));
     expect(reply?.text).toBe('Consejo breve.');
+  });
+
+  it('registra gasto con categoría inexistente si el agente encuentra un match confiable', async () => {
+    const { repo, reportsDir } = setup();
+    repo.upsertBudget('2026-04', 100000, [{ name: 'Supermercado', limit: 30000, kind: 'shared' }]);
+    const client = new CodexAdviceClient(
+      { codexBin: 'codex', repoRoot: process.cwd(), timeoutMs: 1000 },
+      async ({ stdin }) => {
+        expect(stdin).toContain('Categoría pedida: super');
+        return { code: 0, stdout: '{"matchedCategory":"Supermercado","confidence":0.92,"reason":"abreviatura"}', stderr: '', timedOut: false };
+      }
+    );
+    const engine = new UseCaseEngine(repo, { currency: 'ARS', reportsDir }, client);
+    const reply = await engine.handle({ ...baseMessage, text: 'gasté 10000 en super' }, parsed({
+      intent: 'register_expense',
+      confidence: 0.9,
+      amount: 10000,
+      category: 'super'
+    }));
+    expect(reply?.actionTaken).toBe(true);
+    expect(reply?.text).toContain('Interpreté "super" como "Supermercado"');
+    expect(repo.recentExpenses()[0]?.category).toBe('Supermercado');
+  });
+
+  it('pide elegir crear categoría o Varios si no hay match de agente', async () => {
+    const { repo, reportsDir } = setup();
+    repo.upsertBudget('2026-04', 100000, [{ name: 'Comida', limit: 30000, kind: 'shared' }]);
+    const client = new CodexAdviceClient(
+      { codexBin: 'codex', repoRoot: process.cwd(), timeoutMs: 1000 },
+      async () => ({ code: 0, stdout: '{"matchedCategory":null,"confidence":0.2,"reason":"sin match"}', stderr: '', timedOut: false })
+    );
+    const engine = new UseCaseEngine(repo, { currency: 'ARS', reportsDir }, client);
+    const reply = await engine.handle({ ...baseMessage, text: 'gasté 10000 en farmacia' }, parsed({
+      intent: 'register_expense',
+      confidence: 0.9,
+      amount: 10000,
+      category: 'Farmacia'
+    }));
+    expect(reply?.actionTaken).toBeFalsy();
+    expect(reply?.text).toContain('crear categoría');
+    expect(repo.recentExpenses()).toHaveLength(0);
+  });
+
+  it('cae a confirmación manual si no hay cliente Codex para categoría inexistente', async () => {
+    const { repo, engine } = setup();
+    repo.upsertBudget('2026-04', 100000, [{ name: 'Comida', limit: 30000, kind: 'shared' }]);
+    const reply = await engine.handle({ ...baseMessage, text: 'gasté 10000 en farmacia' }, parsed({
+      intent: 'register_expense',
+      confidence: 0.9,
+      amount: 10000,
+      category: 'Farmacia'
+    }));
+    expect(reply?.text).toContain('crear categoría');
+    expect(repo.recentExpenses()).toHaveLength(0);
+  });
+
+  it('confirma crear categoría nueva con límite cero y registra el gasto', async () => {
+    const { repo, engine } = setup();
+    repo.upsertBudget('2026-04', 100000, [{ name: 'Comida', limit: 30000, kind: 'shared' }]);
+    await engine.handle({ ...baseMessage, text: 'gasté 10000 en farmacia' }, parsed({
+      intent: 'register_expense',
+      confidence: 0.9,
+      amount: 10000,
+      category: 'Farmacia'
+    }));
+    const confirmed = await engine.handle({ ...baseMessage, text: 'crear categoría' }, parsed({ intent: 'confirm', confidence: 1 }));
+    const summary = repo.budgetSummary(new Date('2026-04-26'));
+    expect(confirmed?.actionTaken).toBe(true);
+    expect(repo.recentExpenses()[0]?.category).toBe('Farmacia');
+    expect(summary?.categories.find((item) => item.name === 'Farmacia')?.limit).toBe(0);
+  });
+
+  it('confirma Varios con límite cero y registra el gasto', async () => {
+    const { repo, engine } = setup();
+    repo.upsertBudget('2026-04', 100000, [{ name: 'Comida', limit: 30000, kind: 'shared' }]);
+    await engine.handle({ ...baseMessage, text: 'gasté 10000 en kiosco' }, parsed({
+      intent: 'register_expense',
+      confidence: 0.9,
+      amount: 10000,
+      category: 'Kiosco'
+    }));
+    const confirmed = await engine.handle({ ...baseMessage, text: 'varios' }, parsed({ intent: 'confirm', confidence: 1 }));
+    const summary = repo.budgetSummary(new Date('2026-04-26'));
+    expect(confirmed?.actionTaken).toBe(true);
+    expect(repo.recentExpenses()[0]?.category).toBe('Varios');
+    expect(summary?.categories.find((item) => item.name === 'Varios')?.limit).toBe(0);
   });
 
   it('registra ingreso sin categoría en Sin asignar y aumenta presupuesto', async () => {
@@ -192,8 +301,31 @@ describe('UseCaseEngine', () => {
     repo.upsertBudget('2026-04', 100000, [{ name: 'Comida', limit: 20000, kind: 'shared' }]);
     await engine.handle(baseMessage, parsed({ intent: 'register_credit_card_expense', confidence: 0.9, amount: 10000, creditCard: { name: 'Visa' } }));
     await engine.handle({ ...baseMessage, id: 'm2' }, parsed({ intent: 'register_credit_card_expense', confidence: 0.9, amount: 15000, creditCard: { name: 'Visa' } }));
+    expect(repo.budgetSummary(new Date('2026-04-26'))?.remaining).toBe(100000);
     const summary = repo.budgetSummary(new Date('2026-05-02'));
     expect(summary?.fixedExpenses[0]?.name).toBe('Tarjeta Visa');
     expect(summary?.fixedExpenses[0]?.amount).toBe(25000);
+    expect(summary?.remaining).toBe(-25000);
+  });
+
+  it('usa la fecha parseada para proyectar tarjeta al mes siguiente de la compra', async () => {
+    const { repo, engine } = setup();
+    repo.upsertBudget('2026-04', 100000, [{ name: 'Comida', limit: 20000, kind: 'shared' }]);
+    await engine.handle(
+      { ...baseMessage, timestamp: new Date('2026-05-01T12:00:00Z') },
+      parsed({ intent: 'register_credit_card_expense', confidence: 0.9, amount: 12000, date: '2026-04-30', creditCard: { name: 'Visa' } })
+    );
+    expect(repo.budgetSummary(new Date('2026-05-02'))?.fixedExpenses[0]?.amount).toBe(12000);
+    expect(repo.budgetSummary(new Date('2026-06-02'))).toBeUndefined();
+  });
+
+  it('incluye tarjetas proyectadas en el contexto del agente', async () => {
+    const { repo, engine } = setup();
+    repo.upsertBudget('2026-04', 100000, [{ name: 'Comida', limit: 20000, kind: 'shared' }]);
+    await engine.handle(baseMessage, parsed({ intent: 'register_credit_card_expense', confidence: 0.9, amount: 10000, creditCard: { name: 'Visa' } }));
+    const context = new FinancialContextBuilder(repo).build();
+    expect(context.nextPeriod?.period).toBe('2026-05');
+    expect(context.nextPeriod?.fixedExpenses[0]?.source).toBe('credit_card');
+    expect(context.alerts.join(' ')).toContain('Tarjeta proyectada');
   });
 });

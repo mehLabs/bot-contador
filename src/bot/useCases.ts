@@ -5,6 +5,20 @@ import { createAvailabilityReport } from '../report/excel.js';
 import { BotReply, IncomingMessage, ParsedMessage } from '../types.js';
 import { currentPeriod, formatMoney, nextPeriod } from '../utils/format.js';
 
+type PendingUnknownCategoryExpense = {
+  amount: number;
+  requestedCategory: string;
+  description: string;
+  personId: number;
+  senderJid: string;
+  groupJid: string;
+  messageId: string;
+  receiptPath?: string;
+  date?: string | null;
+};
+
+const CATEGORY_MATCH_CONFIDENCE_THRESHOLD = 0.8;
+
 export class UseCaseEngine {
   constructor(
     private readonly repo: Repository,
@@ -21,7 +35,7 @@ export class UseCaseEngine {
       case 'cancel_expense':
         return this.cancelExpense(message, parsed);
       case 'availability':
-        return this.availability(true);
+        return this.availability(true, parsed.category);
       case 'setup_budget':
       case 'update_budget':
         return this.setupBudget(message, parsed, currentPeriod());
@@ -72,10 +86,27 @@ export class UseCaseEngine {
     return `${advice}\n\nActualizá tus metas de corto, mediano y largo plazo cuando puedas.`;
   }
 
-  async availability(withAttachment: boolean): Promise<BotReply> {
+  async availability(withAttachment: boolean, categoryName?: string | null): Promise<BotReply> {
     const summary = this.repo.budgetSummary();
     if (!summary) {
       return { text: `Todavía no hay presupuesto configurado para ${currentPeriod()}. Mandá el total mensual y las categorías para empezar.` };
+    }
+    if (categoryName) {
+      const category = summary.categories.find((item) => item.name.toLowerCase() === categoryName.toLowerCase());
+      if (!category) {
+        const available = summary.categories.map((item) => item.name).join(', ') || 'ninguna';
+        return { text: `No encontré la categoría "${categoryName}" en ${summary.period}. Categorías disponibles: ${available}.` };
+      }
+      const owner = category.personName ? ` (${category.personName})` : '';
+      return {
+        text: [
+          `Disponibilidad de ${category.name}${owner} en ${summary.period}`,
+          `Presupuesto: ${formatMoney(category.limit, this.options.currency)}`,
+          `Gastado: ${formatMoney(category.spent, this.options.currency)}`,
+          `Disponible: ${formatRemaining(category.remaining, this.options.currency)}`
+        ].join('\n'),
+        actionTaken: true
+      };
     }
     const lines = [
       `Disponibilidad de ${summary.period}`,
@@ -140,32 +171,102 @@ export class UseCaseEngine {
     return { text: advice, actionTaken: true };
   }
 
-  private registerExpense(message: IncomingMessage, parsed: ParsedMessage): BotReply {
+  private async registerExpense(message: IncomingMessage, parsed: ParsedMessage): Promise<BotReply> {
     const missing = requiredMissing(parsed, ['amount', 'category']);
     if (missing.length > 0 || parsed.confidence < 0.55 || parsed.needsConfirmation) {
       return { text: `Necesito un dato más para registrar el gasto: ${missing.join(', ') || 'confirmación'}. Mandalo en el grupo y lo cargo.` };
     }
     const personId = parsed.personName ? this.repo.ensurePerson(parsed.personName) : this.repo.personForSender(message.senderJid, message.senderName);
     const description = parsed.description ?? (message.text || 'Gasto sin descripción');
+    const requestedCategory = parsed.category!;
+    const exactCategory = this.repo.findCurrentCategory(requestedCategory, personId);
+    const categoryName = exactCategory?.name ?? (await this.matchExpenseCategory(requestedCategory, message.text, personId));
+    if (!categoryName) {
+      this.repo.savePendingConfirmation({
+        groupJid: message.groupJid,
+        senderJid: message.senderJid,
+        type: 'unknown_category_expense',
+        payload: {
+          amount: parsed.amount!,
+          requestedCategory,
+          description,
+          personId,
+          senderJid: message.senderJid,
+          groupJid: message.groupJid,
+          messageId: message.id,
+          receiptPath: message.image?.fileName,
+          date: parsed.date
+        } satisfies PendingUnknownCategoryExpense
+      });
+      return {
+        text: `No encontré la categoría "${requestedCategory}". ¿Querés crearla como categoría nueva o cargar este gasto en Varios? Respondé "crear categoría" o "varios".`
+      };
+    }
+    return this.createExpenseReply(
+      {
+        amount: parsed.amount!,
+        category: categoryName,
+        description,
+        personId,
+        senderJid: message.senderJid,
+        groupJid: message.groupJid,
+        messageId: message.id,
+        receiptPath: message.image?.fileName,
+        date: parsed.date
+      },
+      requestedCategory
+    );
+  }
+
+  private createExpenseReply(
+    input: {
+      amount: number;
+      category: string;
+      description: string;
+      personId: number;
+      senderJid: string;
+      groupJid: string;
+      messageId: string;
+      receiptPath?: string;
+      date?: string | null;
+    },
+    requestedCategory?: string
+  ): BotReply {
     const expense = this.repo.createExpense({
-      amount: parsed.amount!,
-      category: parsed.category!,
-      description,
-      personId,
-      senderJid: message.senderJid,
-      groupJid: message.groupJid,
-      messageId: message.id,
-      receiptPath: message.image?.fileName,
-      date: parsed.date
+      amount: input.amount,
+      category: input.category,
+      description: input.description,
+      personId: input.personId,
+      senderJid: input.senderJid,
+      groupJid: input.groupJid,
+      messageId: input.messageId,
+      receiptPath: input.receiptPath,
+      date: input.date
     });
     const summary = this.repo.budgetSummary();
-    const category = summary?.categories.find((item) => item.name.toLowerCase() === parsed.category!.toLowerCase());
+    const category = summary?.categories.find((item) => item.name.toLowerCase() === input.category.toLowerCase());
+    const normalizedText =
+      requestedCategory && requestedCategory.toLowerCase() !== input.category.toLowerCase()
+        ? ` Interpreté "${requestedCategory}" como "${input.category}".`
+        : '';
     const categoryText = category ? ` En ${category.name}, ${formatRemaining(category.remaining, this.options.currency)}.` : '';
     const totalText = summary ? ` Quedan ${formatMoney(Math.max(summary.remaining, 0), this.options.currency)} disponibles este mes.` : '';
     return {
-      text: `Registré ${formatMoney(parsed.amount!, this.options.currency)} en ${parsed.category} (${expense.publicId}).${totalText}${categoryText}`,
+      text: `Registré ${formatMoney(input.amount, this.options.currency)} en ${input.category} (${expense.publicId}).${normalizedText}${totalText}${categoryText}`,
       actionTaken: true
     };
+  }
+
+  private async matchExpenseCategory(requestedCategory: string, messageText: string, personId: number): Promise<string | undefined> {
+    if (!this.adviceClient) return undefined;
+    const categories = this.repo
+      .currentCategories()
+      .filter((category) => category.personId == null || category.personId === personId)
+      .map((category) => category.name);
+    if (categories.length === 0) return undefined;
+    const result = await this.adviceClient.matchCategory({ requestedCategory, categories, messageText });
+    if (!result.matchedCategory || result.confidence < CATEGORY_MATCH_CONFIDENCE_THRESHOLD) return undefined;
+    return result.matchedCategory;
   }
 
   private registerCreditCardExpense(message: IncomingMessage, parsed: ParsedMessage): BotReply {
@@ -174,7 +275,7 @@ export class UseCaseEngine {
     if (missing.length > 0 || !cardName || parsed.confidence < 0.55 || parsed.needsConfirmation) {
       return { text: `Necesito monto y tarjeta para registrar el gasto con crédito. Ejemplo: “gasté 30000 con Visa”.` };
     }
-    const fixed = this.repo.addCreditCardFixedExpense(cardName, parsed.amount!, message.timestamp);
+    const fixed = this.repo.addCreditCardFixedExpense(cardName, parsed.amount!, parseMessageDate(parsed.date, message.timestamp));
     return {
       text: `Anoté ${formatMoney(parsed.amount!, this.options.currency)} para ${fixed.name}. Queda como gasto fijo de ${fixed.period}: ${formatMoney(fixed.amount, this.options.currency)} acumulados.`,
       actionTaken: true
@@ -246,7 +347,32 @@ export class UseCaseEngine {
         actionTaken: true
       };
     }
+    if (pending.type === 'unknown_category_expense') {
+      return this.confirmUnknownCategoryExpense(message, pending.payload as PendingUnknownCategoryExpense);
+    }
     return { text: 'Confirmación recibida, pero no encontré una acción compatible para ejecutar.' };
+  }
+
+  private confirmUnknownCategoryExpense(message: IncomingMessage, payload: PendingUnknownCategoryExpense): BotReply {
+    const answer = message.text.trim().toLowerCase();
+    let categoryName: string | undefined;
+    if (/^(crear|crear categoria|crear categoría|nueva|categoria nueva|categoría nueva)\b/.test(answer)) {
+      categoryName = payload.requestedCategory;
+    } else if (/^varios\b/.test(answer)) {
+      categoryName = 'Varios';
+    }
+    if (!categoryName) {
+      this.repo.savePendingConfirmation({
+        groupJid: payload.groupJid,
+        senderJid: payload.senderJid,
+        type: 'unknown_category_expense',
+        payload,
+        ttlMinutes: 60
+      });
+      return { text: 'Necesito una de estas dos respuestas: "crear categoría" o "varios".' };
+    }
+    const category = this.repo.ensureCurrentSharedCategory(categoryName, 0);
+    return this.createExpenseReply({ ...payload, category: category.name }, payload.requestedCategory);
   }
 
   private registerIncome(message: IncomingMessage, parsed: ParsedMessage): BotReply {
@@ -355,4 +481,10 @@ function horizonLabel(value: string): string {
   if (value === 'short') return 'corto plazo';
   if (value === 'medium') return 'mediano plazo';
   return 'largo plazo';
+}
+
+function parseMessageDate(value: string | null | undefined, fallback: Date): Date {
+  if (!value) return fallback;
+  const parsed = new Date(`${value}T00:00:00`);
+  return Number.isNaN(parsed.getTime()) ? fallback : parsed;
 }

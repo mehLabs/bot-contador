@@ -3,6 +3,7 @@ import { Repository } from '../db/repository.js';
 export type FinancialAdviceContext = {
   generatedAt: string;
   currentPeriod: ReturnType<Repository['financialContextForCurrentPeriod']>;
+  nextPeriod: ReturnType<Repository['financialContextForNextPeriod']>;
   recentExpenses: ReturnType<Repository['recentExpensesForAdvice']>;
   categoryTrends: ReturnType<Repository['categoryTrends']>;
   goals: ReturnType<Repository['goals']>;
@@ -14,6 +15,7 @@ export class FinancialContextBuilder {
 
   build(): FinancialAdviceContext {
     const currentPeriod = this.repo.financialContextForCurrentPeriod();
+    const nextPeriod = this.repo.financialContextForNextPeriod();
     const recentExpenses = this.repo.recentExpensesForAdvice(12);
     const categoryTrends = this.repo.categoryTrends(3);
     const goals = this.repo.goals('active');
@@ -31,6 +33,11 @@ export class FinancialContextBuilder {
         if (adjustment.status === 'active') alerts.push(`Hay un ajuste desconocido activo por ${adjustment.amount}; revisar disciplina de registro.`);
       }
     }
+    if (nextPeriod) {
+      for (const fixed of nextPeriod.fixedExpenses) {
+        if (fixed.source === 'credit_card') alerts.push(`Tarjeta proyectada para ${nextPeriod.period}: ${fixed.name} por ${fixed.amount}.`);
+      }
+    }
     for (const goal of goals) {
       if (goal.horizon === 'short') alerts.push(`Meta de corto plazo activa: ${goal.title}. Debe considerarse en el análisis.`);
     }
@@ -38,6 +45,7 @@ export class FinancialContextBuilder {
     return {
       generatedAt: new Date().toISOString(),
       currentPeriod,
+      nextPeriod,
       recentExpenses,
       categoryTrends,
       goals,

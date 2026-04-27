@@ -45,6 +45,7 @@ El modelo no recibe SQL libre. El sistema le entrega un JSON calculado con:
 - Tendencias agregadas por categoría de los últimos periodos.
 - Alertas deterministas, como excedentes o categorías al 80% de uso.
 - Terminal local mediante Codex CLI, con permisos de escritura dentro del workspace.
+- `nextPeriod` incluye gastos fijos proyectados, incluyendo compras con tarjeta cargadas durante el mes actual.
 
 ## Reglas
 
@@ -53,6 +54,7 @@ El modelo no recibe SQL libre. El sistema le entrega un JSON calculado con:
 - Si hay metas cortas por cubrir huecos financieros, priorizar acciones para cubrirlas sin deuda.
 - Actuar en modo agente: planificar, ejecutar comandos si hacen falta, esperar resultados y recién después responder.
 - Actuar en nombre del usuario que hizo la solicitud dentro del alcance del presupuesto compartido.
+- Los gastos con tarjeta de crédito se cargan cuando el usuario los informa, pero impactan como gasto fijo del mes siguiente, no como consumo variable del mes actual.
 - No hacer cambios destructivos ni irreversibles salvo pedido explícito.
 - No dar asesoramiento profesional de inversión, legal ni fiscal.
 - Distinguir hechos calculados de sugerencias.

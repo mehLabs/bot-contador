@@ -68,6 +68,14 @@ export type CategoryTrend = {
   remaining: number;
 };
 
+export type CategoryRef = {
+  id: number;
+  name: string;
+  kind: string;
+  personId: number | null;
+  personName: string | null;
+};
+
 export class Repository {
   constructor(private readonly db: Db, private readonly currency: string) {}
 
@@ -160,7 +168,37 @@ export class Repository {
       .prepare('SELECT id, kind, name, person_id FROM budget_categories WHERE period_id = ? AND lower(name) = lower(?)')
       .all(periodId, name) as Array<{ id: number; kind: string; name: string; person_id: number | null }>;
     if (rows.length === 0) return undefined;
-    return rows.find((row) => row.person_id === personId) ?? rows.find((row) => row.person_id == null) ?? rows[0];
+    return rows.find((row) => row.person_id === personId) ?? rows.find((row) => row.person_id == null);
+  }
+
+  currentCategories(date = new Date()): CategoryRef[] {
+    const period = this.activePeriod(date);
+    if (!period) return [];
+    return this.categoriesForPeriod(period.id);
+  }
+
+  findCurrentCategory(name: string, personId?: number | null, date = new Date()): CategoryRef | undefined {
+    const period = this.activePeriod(date);
+    if (!period) return undefined;
+    const category = this.findCategory(period.id, name, personId);
+    if (!category) return undefined;
+    return this.categoriesForPeriod(period.id).find((item) => item.id === category.id);
+  }
+
+  ensureCurrentSharedCategory(name: string, limit = 0, date = new Date()): CategoryRef {
+    const period = this.activePeriod(date);
+    if (!period) throw new Error(`No hay presupuesto configurado para ${currentPeriod()}.`);
+    const existing = this.categoriesForPeriod(period.id).find((item) => item.personId == null && item.name.toLowerCase() === name.toLowerCase());
+    const id =
+      existing?.id ??
+      Number(
+        this.db
+          .prepare('INSERT INTO budget_categories(period_id, name, limit_cents, kind, person_id) VALUES(?, ?, ?, ?, NULL)')
+          .run(period.id, name, toCents(limit), 'shared').lastInsertRowid
+      );
+    const category = this.categoriesForPeriod(period.id).find((item) => item.id === id);
+    if (!category) throw new Error(`No pude crear la categoría "${name}".`);
+    return category;
   }
 
   ensureCategory(periodId: number, name: string, limit: number, kind: 'shared' | 'personal' = 'shared', personName?: string | null): number {
@@ -424,6 +462,24 @@ export class Repository {
     return this.budgetSummary(date);
   }
 
+  financialContextForNextPeriod(date = new Date()):
+    | {
+        period: string;
+        total: number;
+        spent: number;
+        fixedSpent: number;
+        variableSpent: number;
+        remaining: number;
+        categories: BudgetSummaryCategory[];
+        fixedExpenses: FixedExpenseSummary[];
+        incomes: IncomeSummary[];
+        adjustments: AdviceExpense[];
+      }
+    | undefined {
+    const next = new Date(date.getFullYear(), date.getMonth() + 1, 1);
+    return this.budgetSummary(next);
+  }
+
   categoryTrends(periods = 3): CategoryTrend[] {
     return this.db
       .prepare(
@@ -568,6 +624,23 @@ export class Repository {
       .prepare('SELECT id, name, amount_cents, source FROM fixed_expenses WHERE period_id = ? ORDER BY name')
       .all(periodId)
       .map((row: any) => ({ id: row.id, name: row.name, amount: fromCents(row.amount_cents), source: row.source }));
+  }
+
+  private categoriesForPeriod(periodId: number): CategoryRef[] {
+    return this.db
+      .prepare(
+        `SELECT c.id, c.name, c.kind, c.person_id, p.name person_name
+         FROM budget_categories c LEFT JOIN people p ON p.id = c.person_id
+         WHERE c.period_id = ? ORDER BY c.name`
+      )
+      .all(periodId)
+      .map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        kind: row.kind,
+        personId: row.person_id ?? null,
+        personName: row.person_name ?? null
+      }));
   }
 
   private incomesForPeriod(periodId: number): IncomeSummary[] {
