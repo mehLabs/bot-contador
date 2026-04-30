@@ -18,12 +18,13 @@ type MessageHandler = (message: IncomingMessage) => Promise<void>;
 
 export class WhatsAppClient {
   private sock?: WASocket;
-  private selectedGroupJid?: string;
   private listening = true;
   private handler?: MessageHandler;
   private connectedHandler?: () => Promise<void> | void;
   private sendQueue = Promise.resolve();
   private shouldReconnect = true;
+  private connected = false;
+  private connectedWaiters: Array<() => void> = [];
 
   constructor(private readonly options: { authDir: string; mediaDir: string }) {}
 
@@ -35,14 +36,6 @@ export class WhatsAppClient {
     this.connectedHandler = handler;
   }
 
-  setSelectedGroup(jid: string): void {
-    this.selectedGroupJid = jid;
-  }
-
-  getSelectedGroup(): string | undefined {
-    return this.selectedGroupJid;
-  }
-
   setListening(value: boolean): void {
     this.listening = value;
   }
@@ -51,8 +44,20 @@ export class WhatsAppClient {
     return this.listening;
   }
 
+  isConnected(): boolean {
+    return this.connected;
+  }
+
+  waitUntilConnected(): Promise<void> {
+    if (this.connected) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.connectedWaiters.push(resolve);
+    });
+  }
+
   async connect(): Promise<void> {
     this.shouldReconnect = true;
+    this.connected = false;
     fs.mkdirSync(this.options.authDir, { recursive: true });
     fs.mkdirSync(this.options.mediaDir, { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(this.options.authDir);
@@ -76,16 +81,20 @@ export class WhatsAppClient {
         qrcode.generate(qr, { small: true });
       }
       if (connection === 'open') {
+        this.connected = true;
         console.log('WhatsApp conectado.');
+        this.resolveConnectedWaiters();
         void this.connectedHandler?.();
       }
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
         console.log(`WhatsApp desconectado (${statusCode ?? 'sin código'}).`);
         this.sock = undefined;
+        this.connected = false;
         if (statusCode === DisconnectReason.loggedOut) {
           this.shouldReconnect = false;
           console.log('La sesión local de WhatsApp fue revocada o expiró. Usá wa-reset en la consola y luego connect para generar un QR nuevo.');
+          this.resolveConnectedWaiters();
           return;
         }
         if (this.shouldReconnect) void this.connect();
@@ -102,6 +111,7 @@ export class WhatsAppClient {
     this.shouldReconnect = false;
     this.sock?.end(undefined);
     this.sock = undefined;
+    this.connected = false;
   }
 
   async logoutAndClearAuth(): Promise<void> {
@@ -109,6 +119,7 @@ export class WhatsAppClient {
     await this.sock?.logout().catch(() => undefined);
     this.sock?.end(undefined);
     this.sock = undefined;
+    this.connected = false;
     this.clearAuth();
   }
 
@@ -127,9 +138,8 @@ export class WhatsAppClient {
     }));
   }
 
-  async sendText(text: string): Promise<void> {
-    const jid = this.selectedGroupJid;
-    if (!jid || !this.sock) return;
+  async sendText(jid: string, text: string): Promise<void> {
+    if (!this.sock) return;
     this.sendQueue = this.sendQueue.then(async () => {
       await this.sock!.sendPresenceUpdate('composing', jid);
       await sleep(typingDelayMs(text));
@@ -139,9 +149,8 @@ export class WhatsAppClient {
     await this.sendQueue;
   }
 
-  async whileComposing<T>(task: () => Promise<T>): Promise<T> {
-    const jid = this.selectedGroupJid;
-    if (!jid || !this.sock) return task();
+  async whileComposing<T>(jid: string, task: () => Promise<T>): Promise<T> {
+    if (!this.sock) return task();
     await this.sock.sendPresenceUpdate('composing', jid).catch(() => undefined);
     const pulse = setInterval(() => {
       void this.sock?.sendPresenceUpdate('composing', jid).catch(() => undefined);
@@ -154,9 +163,8 @@ export class WhatsAppClient {
     }
   }
 
-  async sendDocument(filePath: string, caption?: string): Promise<void> {
-    const jid = this.selectedGroupJid;
-    if (!jid || !this.sock) return;
+  async sendDocument(jid: string, filePath: string, caption?: string): Promise<void> {
+    if (!this.sock) return;
     await this.sock.sendMessage(jid, {
       document: { url: filePath },
       fileName: path.basename(filePath),
@@ -177,13 +185,13 @@ export class WhatsAppClient {
   }
 
   private async handleRawMessage(raw: WAMessage): Promise<void> {
-    if (!this.handler || !this.selectedGroupJid || !this.listening) return;
+    if (!this.handler || !this.listening) return;
     const groupJid = raw.key.remoteJid;
     const selfJid = this.sock?.user?.id?.split(':')[0];
     const senderJid = raw.key.participant ?? raw.participant ?? groupJid;
     if (!senderJid) return;
     const senderPhone = senderJid.split('@')[0]?.split(':')[0];
-    if (!groupJid || groupJid !== this.selectedGroupJid || raw.key.fromMe || (selfJid && senderPhone && selfJid === senderPhone)) return;
+    if (!groupJid || !groupJid.endsWith('@g.us') || raw.key.fromMe || (selfJid && senderPhone && selfJid === senderPhone)) return;
     const text = extractText(raw);
     const imageMessage = raw.message?.imageMessage;
     const image = imageMessage ? await this.downloadImage(raw, imageMessage.mimetype ?? 'image/jpeg') : undefined;
@@ -197,6 +205,11 @@ export class WhatsAppClient {
       timestamp: new Date(Number(raw.messageTimestamp ?? Date.now()) * 1000),
       image
     });
+  }
+
+  private resolveConnectedWaiters(): void {
+    const waiters = this.connectedWaiters.splice(0);
+    waiters.forEach((resolve) => resolve());
   }
 
   private async downloadImage(raw: WAMessage, mimeType: string): Promise<IncomingMessage['image']> {

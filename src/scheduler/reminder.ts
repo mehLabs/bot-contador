@@ -1,13 +1,19 @@
 import cron from 'node-cron';
-import { UseCaseEngine } from '../bot/useCases.js';
-import { WhatsAppClient } from '../whatsapp/client.js';
+import { CounterBot } from '../bot/counterBot.js';
 
-export function startDailyReminder(input: { timezone: string; whatsapp: WhatsAppClient; engine: UseCaseEngine }): void {
+export function startDailyReminder(input: {
+  timezone: string;
+  sender: { sendText: (jid: string, text: string) => Promise<void> };
+  counterBot: CounterBot;
+  isCounterBotActive: () => boolean;
+}): void {
   cron.schedule(
     '0 22 * * *',
     async () => {
-      if (!input.whatsapp.getSelectedGroup()) return;
-      await input.whatsapp.sendText(input.engine.reminderText());
+      if (!input.isCounterBotActive()) return;
+      const groupJid = input.counterBot.getGroup();
+      if (!groupJid) return;
+      await input.sender.sendText(groupJid, input.counterBot.reminderText());
     },
     { timezone: input.timezone }
   );
@@ -15,8 +21,10 @@ export function startDailyReminder(input: { timezone: string; whatsapp: WhatsApp
   cron.schedule(
     '0 9 1 * *',
     async () => {
-      if (!input.whatsapp.getSelectedGroup()) return;
-      await input.whatsapp.sendText(await input.engine.monthlyAnalysisText());
+      if (!input.isCounterBotActive()) return;
+      const groupJid = input.counterBot.getGroup();
+      if (!groupJid) return;
+      await input.sender.sendText(groupJid, await input.counterBot.monthlyAnalysisText());
     },
     { timezone: input.timezone }
   );

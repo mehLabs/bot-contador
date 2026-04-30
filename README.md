@@ -12,15 +12,22 @@ Bot local de WhatsApp para presupuesto compartido. Usa Baileys para conectar por
 npm run dev
 ```
 
-El bot imprime el QR en terminal. Cuando WhatsApp conecta, lista los grupos disponibles; elegí el número del grupo que debe escuchar. Todo mensaje que no venga de ese grupo se ignora.
+El bot imprime el QR en terminal. Cuando WhatsApp conecta, la app abre un menú principal interactivo. Desde `Acciones bots` podés activar bots, elegir el grupo del `Bot contador` y entrar a sus acciones propias.
+Todo mensaje de grupos queda disponible para el pipeline, pero el contador solo procesa su grupo configurado cuando está activo.
 
-## Comandos de consola
+## Menú de consola
 
-`groups`, `status`, `pause`, `resume`, `connect`, `disconnect`, `wa-reset`, `export`, `recent`, `openai-login`, `openai-status`, `openai-test`, `dropdb`, `help`, `exit`.
+- `Estado general`: conexión, escucha y bots activos.
+- `Cuenta WhatsApp`: conectar, desconectar, pausar/reanudar escucha y resetear sesión local.
+- `Base de datos`: borrar la base local con confirmación fuerte.
+- `Acciones bots`: seleccionar bots activos y entrar al menú de cada bot.
+- `Salir`: cierra WhatsApp, la base y la app.
 
-`disconnect` solo cierra la conexión local y conserva la sesión. Si WhatsApp devuelve `401` o la sesión quedó inválida, usá `wa-reset` y después `connect` para generar un QR nuevo.
+El menú del `Bot contador` permite activarlo/desactivarlo, elegir grupo, exportar reporte, ver gastos recientes y ejecutar acciones OpenAI/Codex.
 
-Los comandos `openai-*` usan Codex CLI:
+Desconectar solo cierra la conexión local y conserva la sesión. Si WhatsApp devuelve `401` o la sesión quedó inválida, usá `Cuenta WhatsApp > Resetear sesión local` y después `Conectar` para generar un QR nuevo.
+
+Las acciones OpenAI/Codex del bot contador usan Codex CLI:
 
 - `openai-login` ejecuta `codex login` y abre el flujo de autenticación por navegador.
 - `openai-status` muestra el estado de sesión.

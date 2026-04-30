@@ -1,93 +1,201 @@
-import readline from 'node:readline/promises';
-import { stdin as input, stdout as output } from 'node:process';
-import { spawn } from 'node:child_process';
+import { checkbox, input, select } from '@inquirer/prompts';
 import { resetDatabase } from '../db/database.js';
 import { Repository } from '../db/repository.js';
+import { BotInstance } from '../bot/types.js';
+import { BotPipeline } from '../bot/pipeline.js';
 import { WhatsAppClient } from '../whatsapp/client.js';
-import { CodexAdviceClient } from '../advice/codexAdviceClient.js';
-import { FinancialContextBuilder } from '../advice/financialContext.js';
+
+type MainOption = 'status' | 'whatsapp' | 'database' | 'bots' | 'exit';
+type WhatsAppOption = 'connect' | 'disconnect' | 'pause' | 'resume' | 'reset' | 'status' | 'back';
+type DatabaseOption = 'dropdb' | 'back';
+type BotOption = 'select-active' | 'list-active' | `bot:${string}` | 'back';
+type BotMenuOption = 'toggle' | 'configure' | 'status' | `action:${string}` | 'back';
 
 export class TerminalController {
-  private readonly rl = readline.createInterface({ input, output });
-
   constructor(
     private readonly whatsapp: WhatsAppClient,
     private readonly repo: Repository,
-    private readonly onExit: () => Promise<void> | void,
-    private readonly onExport: () => Promise<string | undefined>,
-    private readonly codexOptions: { codexBin: string; repoRoot: string },
-    private readonly adviceClient?: CodexAdviceClient
+    private readonly pipeline: BotPipeline,
+    private readonly availableBots: BotInstance[],
+    private readonly onExit: () => Promise<void> | void
   ) {}
 
   async start(): Promise<void> {
-    this.printHelp();
     while (true) {
-      const command = (await this.rl.question('bot-contador> ')).trim().toLowerCase();
-      if (!command) continue;
-      if (command === 'help' || command === '?') this.printHelp();
-      else if (command === 'groups') await this.chooseGroup();
-      else if (command === 'status') this.status();
-      else if (command === 'pause') this.whatsapp.setListening(false);
-      else if (command === 'resume') this.whatsapp.setListening(true);
-      else if (command === 'disconnect') await this.whatsapp.disconnect();
-      else if (command === 'connect') await this.whatsapp.connect();
-      else if (command === 'wa-reset') await this.resetWhatsAppSession();
-      else if (command === 'export') await this.exportReport();
-      else if (command === 'recent') this.printRecent();
-      else if (command === 'openai-login') await this.runInteractiveCodex(['login']);
-      else if (command === 'openai-status') await this.runInteractiveCodex(['login', 'status']);
-      else if (command === 'openai-test') await this.openaiTest();
-      else if (command === 'dropdb') await this.dropDb();
-      else if (command === 'exit' || command === 'quit') {
+      const option = await select<MainOption>({
+        message: 'Menú principal',
+        choices: [
+          { name: 'Estado general', value: 'status' },
+          { name: 'Cuenta WhatsApp', value: 'whatsapp' },
+          { name: 'Base de datos', value: 'database' },
+          { name: 'Acciones bots', value: 'bots' },
+          { name: 'Salir', value: 'exit' }
+        ]
+      });
+
+      if (option === 'status') this.printStatus();
+      else if (option === 'whatsapp') await this.whatsappMenu();
+      else if (option === 'database') await this.databaseMenu();
+      else if (option === 'bots') await this.botsMenu();
+      else if (option === 'exit') {
         await this.onExit();
-        this.rl.close();
         return;
-      } else {
-        console.log('Comando no reconocido. Usá help para ver opciones.');
       }
     }
   }
 
-  async chooseGroup(): Promise<void> {
-    const groups = await this.whatsapp.groups();
-    if (groups.length === 0) {
-      console.log('No encontré grupos. Verificá que WhatsApp esté conectado.');
-      return;
+  private async whatsappMenu(): Promise<void> {
+    while (true) {
+      const option = await select<WhatsAppOption>({
+        message: 'Cuenta WhatsApp',
+        choices: [
+          { name: 'Conectar', value: 'connect' },
+          { name: 'Desconectar', value: 'disconnect' },
+          { name: 'Pausar escucha', value: 'pause' },
+          { name: 'Reanudar escucha', value: 'resume' },
+          { name: 'Resetear sesión local', value: 'reset' },
+          { name: 'Ver estado', value: 'status' },
+          { name: 'Volver', value: 'back' }
+        ]
+      });
+      if (option === 'connect') {
+        await this.whatsapp.connect();
+        await this.whatsapp.waitUntilConnected();
+      } else if (option === 'disconnect') {
+        await this.whatsapp.disconnect();
+      } else if (option === 'pause') {
+        this.whatsapp.setListening(false);
+        console.log('Escucha pausada.');
+      } else if (option === 'resume') {
+        this.whatsapp.setListening(true);
+        console.log('Escucha activa.');
+      } else if (option === 'reset') {
+        await this.resetWhatsAppSession();
+      } else if (option === 'status') {
+        this.printWhatsAppStatus();
+      } else {
+        return;
+      }
     }
-    groups.forEach((group, index) => console.log(`${index + 1}. ${group.subject} (${group.participants}) - ${group.jid}`));
-    const answer = await this.rl.question('Elegí número de grupo: ');
-    const index = Number(answer) - 1;
-    const selected = groups[index];
-    if (!selected) {
-      console.log('Selección inválida.');
-      return;
-    }
-    this.whatsapp.setSelectedGroup(selected.jid);
-    this.repo.setSetting('selected_group_jid', selected.jid);
-    this.repo.setSetting('selected_group_subject', selected.subject);
-    console.log(`Escuchando: ${selected.subject}`);
   }
 
-  private status(): void {
-    console.log(`Grupo activo: ${this.whatsapp.getSelectedGroup() ?? 'sin seleccionar'}`);
+  private async databaseMenu(): Promise<void> {
+    while (true) {
+      const option = await select<DatabaseOption>({
+        message: 'Base de datos',
+        choices: [
+          { name: 'Borrar base local', value: 'dropdb' },
+          { name: 'Volver', value: 'back' }
+        ]
+      });
+      if (option === 'dropdb') await this.dropDb();
+      else return;
+    }
+  }
+
+  private async botsMenu(): Promise<void> {
+    while (true) {
+      const option = await select<BotOption>({
+        message: 'Acciones bots',
+        choices: [
+          { name: 'Seleccionar bots activos', value: 'select-active' },
+          { name: 'Listar bots activos', value: 'list-active' },
+          ...this.availableBots.map((bot) => ({
+            name: `${bot.name}${this.pipeline.isActive(bot.id) ? ' (activo)' : ''}`,
+            value: `bot:${bot.id}` as const,
+            description: bot.description
+          })),
+          { name: 'Volver', value: 'back' }
+        ]
+      });
+      if (option === 'select-active') await this.selectActiveBots();
+      else if (option === 'list-active') this.printActiveBots();
+      else if (option.startsWith('bot:')) {
+        const bot = this.availableBots.find((item) => item.id === option.slice(4));
+        if (bot) await this.botMenu(bot);
+      } else {
+        return;
+      }
+    }
+  }
+
+  private async botMenu(bot: BotInstance): Promise<void> {
+    while (true) {
+      const actions = bot.terminalActions ?? [];
+      const option = await select<BotMenuOption>({
+        message: bot.name,
+        choices: [
+          { name: this.pipeline.isActive(bot.id) ? 'Desactivar bot' : 'Activar bot', value: 'toggle' },
+          { name: 'Configurar', value: 'configure', disabled: bot.configure ? false : 'Sin configuración disponible' },
+          { name: 'Ver estado', value: 'status' },
+          ...actions.map((action) => ({
+            name: action.label,
+            value: `action:${action.id}` as const
+          })),
+          { name: 'Volver', value: 'back' }
+        ]
+      });
+      if (option === 'toggle') await this.toggleBot(bot);
+      else if (option === 'configure') await bot.configure?.();
+      else if (option === 'status') console.log(`${bot.name}: ${bot.status?.() ?? 'sin estado'}`);
+      else if (option.startsWith('action:')) {
+        const action = actions.find((item) => item.id === option.slice(7));
+        await action?.run();
+      } else {
+        return;
+      }
+    }
+  }
+
+  private async selectActiveBots(): Promise<void> {
+    const activeIds = this.pipeline.getActiveBots().map((bot) => bot.id);
+    const selectedIds = await checkbox<string>({
+      message: 'Elegí los bots activos',
+      choices: this.availableBots.map((bot) => ({
+        name: bot.name,
+        value: bot.id,
+        description: bot.description,
+        checked: activeIds.includes(bot.id)
+      }))
+    });
+    const selectedBots = this.availableBots.filter((bot) => selectedIds.includes(bot.id));
+    for (const bot of selectedBots) {
+      await bot.configure?.();
+    }
+    this.pipeline.setActiveBots(selectedBots);
+    this.printActiveBots();
+  }
+
+  private async toggleBot(bot: BotInstance): Promise<void> {
+    if (this.pipeline.isActive(bot.id)) {
+      this.pipeline.deactivate(bot.id);
+      console.log(`${bot.name} desactivado.`);
+      return;
+    }
+    await this.pipeline.activate(bot);
+    console.log(`${bot.name} activado.`);
+  }
+
+  private printStatus(): void {
+    this.printWhatsAppStatus();
     console.log(`Escucha: ${this.whatsapp.isListening() ? 'activa' : 'pausada'}`);
+    this.printActiveBots();
   }
 
-  private printRecent(): void {
-    const recent = this.repo.recentExpenses();
-    if (recent.length === 0) console.log('Sin gastos registrados.');
-    for (const item of recent) {
-      console.log(`${item.publicId} | ${item.amount} | ${item.category} | ${item.description} | ${item.status}`);
+  private printWhatsAppStatus(): void {
+    console.log(`WhatsApp: ${this.whatsapp.isConnected() ? 'conectado' : 'desconectado'}`);
+  }
+
+  private printActiveBots(): void {
+    const activeBots = this.pipeline.getActiveBots();
+    console.log(`Bots activos: ${activeBots.length ? activeBots.map((bot) => bot.name).join(', ') : 'ninguno'}`);
+    for (const bot of activeBots) {
+      console.log(`- ${bot.name}: ${bot.status?.() ?? 'sin estado'}`);
     }
-  }
-
-  private async exportReport(): Promise<void> {
-    const filePath = await this.onExport();
-    console.log(filePath ? `Reporte generado: ${filePath}` : 'No hay presupuesto activo para exportar.');
   }
 
   private async dropDb(): Promise<void> {
-    const answer = await this.rl.question('Esto borra la base local. Escribí DROP para confirmar: ');
+    const answer = await input({ message: 'Esto borra la base local. Escribí DROP para confirmar:' });
     if (answer !== 'DROP') {
       console.log('Cancelado.');
       return;
@@ -97,42 +205,12 @@ export class TerminalController {
   }
 
   private async resetWhatsAppSession(): Promise<void> {
-    const answer = await this.rl.question('Esto borra la sesión local de WhatsApp y fuerza un QR nuevo. Escribí RESET-WA para confirmar: ');
+    const answer = await input({ message: 'Esto borra la sesión local de WhatsApp y fuerza un QR nuevo. Escribí RESET-WA para confirmar:' });
     if (answer !== 'RESET-WA') {
       console.log('Cancelado.');
       return;
     }
     await this.whatsapp.logoutAndClearAuth();
-    console.log('Sesión de WhatsApp borrada. Ejecutá connect para mostrar un QR nuevo.');
-  }
-
-  private async openaiTest(): Promise<void> {
-    if (!this.adviceClient) {
-      console.log('El cliente de consejos no está configurado.');
-      return;
-    }
-    const context = new FinancialContextBuilder(this.repo).build();
-    const answer = await this.adviceClient.advise('Respondé en una línea si podés leer este contexto financiero.', context);
-    console.log(answer);
-  }
-
-  private runInteractiveCodex(args: string[]): Promise<void> {
-    return new Promise((resolve) => {
-      const child = spawn(this.codexOptions.codexBin, args, {
-        cwd: this.codexOptions.repoRoot,
-        stdio: 'inherit',
-        windowsHide: false
-      });
-      child.on('error', (error) => {
-        console.log(`No pude ejecutar ${this.codexOptions.codexBin}: ${error.message}`);
-        console.log('Si Codex está instalado pero no aparece en PATH, configurá CODEX_BIN con la ruta completa a codex.exe en .env.');
-        resolve();
-      });
-      child.on('close', () => resolve());
-    });
-  }
-
-  private printHelp(): void {
-    console.log('Comandos: groups, status, pause, resume, connect, disconnect, wa-reset, export, recent, openai-login, openai-status, openai-test, dropdb, help, exit');
+    console.log('Sesión de WhatsApp borrada. Usá Cuenta WhatsApp > Conectar para mostrar un QR nuevo.');
   }
 }
