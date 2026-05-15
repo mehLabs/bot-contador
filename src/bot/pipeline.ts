@@ -20,7 +20,8 @@ export class BotPipeline {
 
   async activate(bot: BotInstance): Promise<void> {
     if (this.isActive(bot.id)) return;
-    await bot.configure?.();
+    const configured = await bot.configure?.();
+    if (configured === false) return;
     this.activeBots = [...this.activeBots, bot];
   }
 
@@ -31,7 +32,7 @@ export class BotPipeline {
   async handle(message: IncomingMessage): Promise<void> {
     for (const bot of this.activeBots) {
       try {
-        const result = await bot.handle(message, this.ctx);
+        const result = await this.ctx.whileComposing(message.groupJid, () => bot.handle(message, this.ctx));
         if (!result.handled) continue;
         if (result.reply) {
           await this.ctx.sendText(message.groupJid, result.reply.text);

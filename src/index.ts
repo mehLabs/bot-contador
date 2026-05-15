@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { select } from '@inquirer/prompts';
+import { LinearClient } from '@linear/sdk';
 import { loadConfig } from './config.js';
 import { openDatabase } from './db/database.js';
 import { Repository } from './db/repository.js';
@@ -9,11 +10,14 @@ import { UseCaseEngine } from './bot/useCases.js';
 import { WhatsAppClient } from './whatsapp/client.js';
 import { TerminalController } from './console/terminal.js';
 import { startDailyReminder } from './scheduler/reminder.js';
+import { startLinearNotifications } from './scheduler/linearNotifications.js';
 import { CodexAdviceClient } from './advice/codexAdviceClient.js';
 import { BotPipeline } from './bot/pipeline.js';
 import { CounterBot } from './bot/counterBot.js';
+import { LinearNotificationBot } from './bot/linearNotificationBot.js';
 import { BotInstance } from './bot/types.js';
 import { FinancialContextBuilder } from './advice/financialContext.js';
+import { LinearNotificationService } from './linear/notifications.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -38,14 +42,14 @@ async function main(): Promise<void> {
     markRead: (message) => whatsapp.markRead(message)
   });
 
-  const chooseGroup = async (): Promise<{ jid: string; subject: string } | undefined> => {
+  const chooseGroup = async (message: string): Promise<{ jid: string; subject: string } | undefined> => {
     const groups = await whatsapp.groups();
     if (groups.length === 0) {
       console.log('No encontré grupos. Verificá que WhatsApp esté conectado.');
       return undefined;
     }
     const jid = await select({
-      message: 'Elegí el grupo para el bot contador',
+      message,
       choices: groups.map((group) => ({
         name: `${group.subject} (${group.participants})`,
         value: group.jid,
@@ -55,7 +59,7 @@ async function main(): Promise<void> {
     const selectedGroup = groups.find((group) => group.jid === jid);
     return selectedGroup ? { jid: selectedGroup.jid, subject: selectedGroup.subject } : undefined;
   };
-  const counterBot = new CounterBot(repo, parser, engine, chooseGroup, adviceClient);
+  const counterBot = new CounterBot(repo, parser, engine, () => chooseGroup('Elegí el grupo para el bot contador'), adviceClient);
   counterBot.restoreGroup();
   counterBot.terminalActions = [
     {
@@ -105,7 +109,37 @@ async function main(): Promise<void> {
       }
     }
   ];
-  const availableBots: BotInstance[] = [counterBot];
+  const linearService = config.linearApiKey ? new LinearNotificationService(new LinearClient({ apiKey: config.linearApiKey })) : undefined;
+  const linearBot = new LinearNotificationBot(repo, linearService, () => chooseGroup('Elegí el grupo para el bot Linear'));
+  linearBot.restoreGroup();
+  linearBot.terminalActions = [
+    {
+      id: 'choose-group',
+      label: 'Elegir grupo',
+      run: () => linearBot.selectGroup()
+    },
+    {
+      id: 'send-now',
+      label: 'Enviar resumen ahora (prueba)',
+      run: async () => {
+        const configured = await linearBot.configure();
+        if (configured === false) return;
+        const groupJid = linearBot.getGroup();
+        if (!groupJid) {
+          console.log('Bot Linear sin grupo configurado.');
+          return;
+        }
+        try {
+          const text = await whatsapp.whileComposing(groupJid, () => linearBot.dailyMessage());
+          await whatsapp.sendText(groupJid, text);
+        } catch (error) {
+          const messageText = error instanceof Error ? error.message : String(error);
+          console.log(`No pude obtener los issues de Linear: ${messageText}`);
+        }
+      }
+    }
+  ];
+  const availableBots: BotInstance[] = [counterBot, linearBot];
 
   whatsapp.setMessageHandler((message) => pipeline.handle(message));
 
@@ -124,14 +158,29 @@ async function main(): Promise<void> {
   if (!parser.isConfigured()) {
     console.warn('Aviso: GEMINI_API_KEY no está configurada. El bot conectará, pero no podrá interpretar mensajes.');
   }
+  if (!config.linearApiKey) {
+    console.warn('Aviso: LINEAR_API_KEY no está configurada. El Bot Linear no se podrá activar.');
+  }
 
   await whatsapp.connect();
   await whatsapp.waitUntilConnected();
   startDailyReminder({
     timezone: config.timezone,
-    sender: whatsapp,
+    sender: {
+      sendText: (jid, text) => whatsapp.sendText(jid, text),
+      whileComposing: (jid, task) => whatsapp.whileComposing(jid, task)
+    },
     counterBot,
     isCounterBotActive: () => pipeline.isActive(counterBot.id)
+  });
+  startLinearNotifications({
+    timezone: config.timezone,
+    sender: {
+      sendText: (jid, text) => whatsapp.sendText(jid, text),
+      whileComposing: (jid, task) => whatsapp.whileComposing(jid, task)
+    },
+    linearBot,
+    isLinearBotActive: () => pipeline.isActive(linearBot.id)
   });
   await terminal.start();
 }

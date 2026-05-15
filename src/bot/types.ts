@@ -30,7 +30,7 @@ export type BotInstance = {
   name: string;
   description: string;
   handle: (message: IncomingMessage, ctx: BotContext) => Promise<BotHandleResult>;
-  configure?: () => Promise<void>;
+  configure?: () => Promise<void | false>;
   status?: () => string;
   terminalActions?: BotTerminalAction[];
 };

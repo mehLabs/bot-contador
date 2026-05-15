@@ -15,6 +15,7 @@ function ctx() {
   const sent: Array<{ jid: string; text: string }> = [];
   const documents: Array<{ jid: string; filePath: string; caption?: string }> = [];
   const read: string[] = [];
+  const composing: string[] = [];
   const context: BotContext = {
     sendText: async (jid, text) => {
       sent.push({ jid, text });
@@ -22,12 +23,15 @@ function ctx() {
     sendDocument: async (jid, filePath, caption) => {
       documents.push({ jid, filePath, caption });
     },
-    whileComposing: async (_jid, task) => task(),
+    whileComposing: async (jid, task) => {
+      composing.push(jid);
+      return task();
+    },
     markRead: async (incoming) => {
       read.push(incoming.id);
     }
   };
-  return { context, sent, documents, read };
+  return { context, sent, documents, read, composing };
 }
 
 function bot(id: string, handle: BotInstance['handle']): BotInstance {
@@ -47,7 +51,7 @@ describe('BotPipeline', () => {
 
   it('ejecuta bots activos en orden', async () => {
     const order: string[] = [];
-    const { context } = ctx();
+    const { context, composing } = ctx();
     const pipeline = new BotPipeline(context);
     pipeline.setActiveBots([
       bot('a', async () => {
@@ -63,6 +67,7 @@ describe('BotPipeline', () => {
     await pipeline.handle(message);
 
     expect(order).toEqual(['a', 'b']);
+    expect(composing).toEqual(['123@g.us', '123@g.us']);
   });
 
   it('corta el pipeline cuando un bot lo pide', async () => {

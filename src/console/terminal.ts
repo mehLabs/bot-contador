@@ -159,10 +159,12 @@ export class TerminalController {
       }))
     });
     const selectedBots = this.availableBots.filter((bot) => selectedIds.includes(bot.id));
+    const configuredBots: BotInstance[] = [];
     for (const bot of selectedBots) {
-      await bot.configure?.();
+      const configured = await bot.configure?.();
+      if (configured !== false) configuredBots.push(bot);
     }
-    this.pipeline.setActiveBots(selectedBots);
+    this.pipeline.setActiveBots(configuredBots);
     this.printActiveBots();
   }
 
@@ -173,7 +175,7 @@ export class TerminalController {
       return;
     }
     await this.pipeline.activate(bot);
-    console.log(`${bot.name} activado.`);
+    console.log(this.pipeline.isActive(bot.id) ? `${bot.name} activado.` : `${bot.name} no se activó.`);
   }
 
   private printStatus(): void {

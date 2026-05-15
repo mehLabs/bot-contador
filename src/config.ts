@@ -5,6 +5,7 @@ import { resolveCodexBin } from './utils/resolveCodexBin.js';
 export type AppConfig = {
   geminiApiKey?: string;
   geminiModel: string;
+  linearApiKey?: string;
   timezone: string;
   currency: string;
   dbPath: string;
@@ -21,6 +22,7 @@ export function loadConfig(): AppConfig {
   return {
     geminiApiKey: process.env.GEMINI_API_KEY,
     geminiModel: process.env.GEMINI_MODEL ?? 'gemini-2.5-flash',
+    linearApiKey: process.env.LINEAR_API_KEY || undefined,
     timezone: process.env.BOT_TIMEZONE ?? 'America/Argentina/Buenos_Aires',
     currency: process.env.BOT_CURRENCY ?? 'ARS',
     dbPath: path.resolve(process.env.DB_PATH ?? 'data/bot-contador.sqlite'),
